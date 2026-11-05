@@ -78,6 +78,22 @@ int pacman_recurrence_v1_reduce(const pacman_recurrence_reduce *reduce);
 // bit 0: op 12 (sources on the device); bit 1: PACMAN_RECURRENCE_FORMS_ON_DEVICE
 #define PACMAN_RECURRENCE_CAP_SOURCES 1u
 #define PACMAN_RECURRENCE_CAP_FORMS 2u
+// The runner's configuration, set once before the first run (later calls fail):
+typedef struct {
+    uint32_t abi_version;  // PACMAN_RECURRENCE_ABI
+    uint32_t struct_size;
+    uint32_t kernel;       // PACMAN_RECURRENCE_KERNEL_*
+    uint32_t block;        // threads per block, 32..1024 (0: 128)
+    uint32_t no_sort;      // 1: keep the contribution rows in plan order
+    uint32_t stats;        // 1: print the statistics at exit
+} pacman_recurrence_options;
+enum {
+    PACMAN_RECURRENCE_KERNEL_DF64 = 0,  // the default
+    PACMAN_RECURRENCE_KERNEL_F64 = 1,
+    PACMAN_RECURRENCE_KERNEL_MIXED = 2,
+    PACMAN_RECURRENCE_KERNEL_MIXED64 = 3,
+};
+int pacman_recurrence_v1_configure(const pacman_recurrence_options *options);
 // bit 2: op 13/14 (symjit rows), with generated kernels (`pacman_recurrence_v1_symjit_kernel`)
 #define PACMAN_RECURRENCE_CAP_SYMJIT 4u
 uint32_t pacman_recurrence_v1_capabilities(void);

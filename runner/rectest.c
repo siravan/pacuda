@@ -1,4 +1,5 @@
 #include <dlfcn.h>
+#include "pacman_recurrence.h"
 #include <math.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -56,6 +57,18 @@ int main(int argc, char **argv) {
     int (*run)(const call_t *) = (int (*)(const call_t *))dlsym(lib, "pacman_recurrence_v1_run");
     int (*reduce)(const reduce_t *) = (int (*)(const reduce_t *))dlsym(lib, "pacman_recurrence_v1_reduce");
     if (!run || !reduce) return 1;
+    /* rectest LIB [f64|df64|mixed|mixed64] [nosort]: the runner's configuration */
+    int (*configure)(const pacman_recurrence_options *) =
+        (int (*)(const pacman_recurrence_options *))dlsym(lib, "pacman_recurrence_v1_configure");
+    if (argc > 2 && configure) {
+        pacman_recurrence_options o = {PACMAN_RECURRENCE_ABI, sizeof o, PACMAN_RECURRENCE_KERNEL_DF64, 0, 0, 0};
+        if (!strcmp(argv[2], "f64")) o.kernel = PACMAN_RECURRENCE_KERNEL_F64;
+        else if (!strcmp(argv[2], "mixed")) o.kernel = PACMAN_RECURRENCE_KERNEL_MIXED;
+        else if (!strcmp(argv[2], "mixed64")) o.kernel = PACMAN_RECURRENCE_KERNEL_MIXED64;
+        else if (strcmp(argv[2], "df64")) { fprintf(stderr, "unknown kernel %s\n", argv[2]); return 2; }
+        o.no_sort = argc > 3 && !strcmp(argv[3], "nosort");
+        if (configure(&o) != 0) { fprintf(stderr, "configure failed\n"); return 1; }
+    }
     /* sources: Weyl 0, 2; vectors 4, 8, 12; tensor 16 (22 planes); stage 1 at 32..43, stage 2 at 44..49 */
     clear(32, 12);
     contrib(2, 1, 0, 0, 4, 32, 0, 0, 1);

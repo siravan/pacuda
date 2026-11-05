@@ -38,6 +38,17 @@ static void init(void) {
     real_reduce = dlsym(lib, "pacman_recurrence_v1_reduce");
     real_capabilities = dlsym(lib, "pacman_recurrence_v1_capabilities");
     real_symjit_kernel = dlsym(lib, "pacman_recurrence_v1_symjit_kernel");  /* optional */
+    /* development tooling: the kernel from PACMAN_RECURRENCE_KERNEL, as the runner's
+     * configuration (the runner itself reads no environment variables) */
+    int (*configure)(const pacman_recurrence_options *) = dlsym(lib, "pacman_recurrence_v1_configure");
+    const char *k = getenv("PACMAN_RECURRENCE_KERNEL");
+    if (configure && k && *k) {
+        pacman_recurrence_options o = {PACMAN_RECURRENCE_ABI, sizeof o, PACMAN_RECURRENCE_KERNEL_DF64, 0, 0, 0};
+        if (!strcmp(k, "f64")) o.kernel = PACMAN_RECURRENCE_KERNEL_F64;
+        else if (!strcmp(k, "mixed")) o.kernel = PACMAN_RECURRENCE_KERNEL_MIXED;
+        else if (!strcmp(k, "mixed64")) o.kernel = PACMAN_RECURRENCE_KERNEL_MIXED64;
+        if (configure(&o) != 0) abort();
+    }
     const char *trace = getenv("PACUDA_TRACE");
     out = fopen(trace ? trace : "pacuda-trace.jsonl", "a");
     if (!out || !real_run || !real_reduce || !real_capabilities) abort();

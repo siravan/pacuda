@@ -1105,37 +1105,27 @@ bool copy_runs(double *dre, double *dim, double *hre, double *him, const uint32_
     return true;
 }
 
-// the kernel: PACMAN_RECURRENCE_KERNEL=df64 (the default: f32-pair arithmetic on a df64 copy of
-// the arena, for GPUs whose FP64 is slow) | f64 (RustiCol's arithmetic bit for bit),
-// PACMAN_RECURRENCE_BLOCK (threads per block, 128), PACMAN_RECURRENCE_SORT=0 (do not sort the
-// contribution rows by destination)
-enum { KERNEL_DF64, KERNEL_F64, KERNEL_MIXED, KERNEL_MIXED64 };
+// The configuration (`pacman_recurrence_v1_configure`, before the first run; the defaults
+// otherwise): the kernel (df64, the default: f32-pair arithmetic on a df64 copy of the arena, for
+// GPUs whose FP64 is slow; f64: RustiCol's arithmetic bit for bit; mixed, mixed64), the threads
+// per block (128), whether the contribution rows are sorted by destination (yes), statistics at
+// exit (no). The runner reads no environment variables.
+enum { KERNEL_DF64 = PACMAN_RECURRENCE_KERNEL_DF64, KERNEL_F64 = PACMAN_RECURRENCE_KERNEL_F64,
+       KERNEL_MIXED = PACMAN_RECURRENCE_KERNEL_MIXED, KERNEL_MIXED64 = PACMAN_RECURRENCE_KERNEL_MIXED64 };
 struct Options {
     int kernel = KERNEL_DF64;
     bool df64 = true;     // the arena (currents, amplitudes, constants) is in the df64 layout
     bool df64_forms = true;  // the momentum forms too (all but f64 and mixed64)
     int block = 128;
+    bool sort = true;
 };
 
-bool sort_option() {
-    const char *v = getenv("PACMAN_RECURRENCE_SORT");
-    return !(v && !strcmp(v, "0"));
-}
+Options current_options;
+bool runs_started = false;
 
-Options options() {
-    static Options o;
-    static bool read = false;
-    if (read) return o;
-    read = true;
-    const char *k = getenv("PACMAN_RECURRENCE_KERNEL");
-    if (k && !strcmp(k, "f64")) { o.kernel = KERNEL_F64; o.df64 = false; o.df64_forms = false; }
-    else if (k && !strcmp(k, "mixed")) o.kernel = KERNEL_MIXED;
-    else if (k && !strcmp(k, "mixed64")) { o.kernel = KERNEL_MIXED64; o.df64_forms = false; }
-    else if (k && *k && strcmp(k, "df64"))
-        fprintf(stderr, "pacman recurrence runner: unknown PACMAN_RECURRENCE_KERNEL=%s, using df64\n", k);
-    if (const char *v = getenv("PACMAN_RECURRENCE_BLOCK")) o.block = std::max(32, std::min(1024, atoi(v)));
-    return o;
-}
+bool sort_option() { return current_options.sort; }
+
+Options options() { return current_options; }
 
 // the program of `call`'s words, built once per words key
 std::unordered_map<uint64_t, Prepared> prepared_programs;
@@ -1293,13 +1283,12 @@ static void initialize() {
     static bool initialized = false;
     if (!initialized) {
         initialized = true;
-        const char *s = getenv("PACMAN_RUNNER_STATS");
-        device.stats = s && *s && strcmp(s, "0") != 0;
         atexit(print_stats);
     }
 }
 
 static int run_locked(const pacman_recurrence_call *in) {
+    runs_started = true;
     initialize();
     const size_t v1_size = offsetof(pacman_recurrence_call, zero_amplitude);
     const size_t v2_size = offsetof(pacman_recurrence_call, external_momenta);
@@ -1600,6 +1589,30 @@ extern "C" int pacman_recurrence_v1_run(const pacman_recurrence_call *in) {
     acquire_runner_lock();
     int status = run_locked(in);
     if (!(status == PACMAN_RECURRENCE_OK && device.kept)) release_runner_lock();
+    return status;
+}
+
+extern "C" int pacman_recurrence_v1_configure(const pacman_recurrence_options *o) {
+    if (!o || o->abi_version != PACMAN_RECURRENCE_ABI || o->struct_size < sizeof(pacman_recurrence_options))
+        return PACMAN_RECURRENCE_INVALID;
+    if (o->kernel > PACMAN_RECURRENCE_KERNEL_MIXED64 || (o->block && (o->block < 32 || o->block > 1024)))
+        return PACMAN_RECURRENCE_INVALID;
+    acquire_runner_lock();
+    int status = PACMAN_RECURRENCE_OK;
+    if (runs_started) {
+        fprintf(stderr, "pacman recurrence runner: configure after the first run\n");
+        status = PACMAN_RECURRENCE_INVALID;
+    } else {
+        Options n;
+        n.kernel = (int)o->kernel;
+        n.df64 = n.kernel != KERNEL_F64;
+        n.df64_forms = n.kernel == KERNEL_DF64 || n.kernel == KERNEL_MIXED;
+        n.block = o->block ? (int)o->block : 128;
+        n.sort = !o->no_sort;
+        current_options = n;
+        device.stats = o->stats != 0;
+    }
+    release_runner_lock();
     return status;
 }
 

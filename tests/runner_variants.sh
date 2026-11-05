@@ -9,14 +9,14 @@ dir=${TMPDIR:-/tmp}/pacuda-rectest-$$
 mkdir -p "$dir"
 trap 'rm -rf "$dir"' EXIT
 "$here/runner/build.sh" "$dir" >/dev/null
-cc -O1 -ffp-contract=off -o "$dir/rectest" "$here/runner/rectest.c" -ldl -lm
-run() { (cd "$dir" && env "$@" ./rectest "$dir/librecurrence.so"); }
-run PACMAN_RECURRENCE_KERNEL=f64 > "$dir/f64" || { [ $? = 77 ] && echo "skipped: no GPU" && exit 0; exit 1; }
-run PACMAN_RECURRENCE_KERNEL=f64 PACMAN_RECURRENCE_SORT=0 > "$dir/f64u"
-run PACMAN_RECURRENCE_KERNEL=df64 > "$dir/df64"
-run -u PACMAN_RECURRENCE_KERNEL > "$dir/default"
-run PACMAN_RECURRENCE_KERNEL=mixed > "$dir/mixed"
-run PACMAN_RECURRENCE_KERNEL=mixed64 > "$dir/mixed64"
+cc -O1 -ffp-contract=off -I"$here/runner" -o "$dir/rectest" "$here/runner/rectest.c" -ldl -lm
+run() { (cd "$dir" && ./rectest "$dir/librecurrence.so" "$@"); }
+run f64 > "$dir/f64" || { [ $? = 77 ] && echo "skipped: no GPU" && exit 0; exit 1; }
+run f64 nosort > "$dir/f64u"
+run df64 > "$dir/df64"
+run > "$dir/default"
+run mixed > "$dir/mixed"
+run mixed64 > "$dir/mixed64"
 cmp -s "$dir/f64" "$dir/f64u" || { echo "f64 unsorted differs from f64" >&2; exit 1; }
 python3 - "$dir" <<'EOF'
 import sys
