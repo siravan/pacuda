@@ -218,6 +218,19 @@ fn conventions() -> J {
                instruction writes it: whatever its planes hold)"),
         ),
         (
+            "sources",
+            o(vec![
+                ("notation", s(r#"a source current's value is factor × w, w the wavefunction of its `wavefunction` field (RustiCol's wavefunctions.rs, in f64): k = (E, px, py, pz) its momentum form, h its helicity, ch its chirality, m the real part of its mass scale; p_T = √(px² + py²); |k| = √(px² + py² + pz²); sign(x) = ±1 with the sign of x (+1 for +0); an incoming leg has E < 0 (its form is minus its momentum)"#)),
+                ("scalar", s(r#"w = (1)"#)),
+                ("weyl particle", s(r#"E > 0: s = 0 if px = py = 0 and pz < 0, else √max(E + pz, 0); a = s; b = −h√(2E) if s = 0, else h·px/s − i·py/s; (h, ch) = (+1, +1): w = (a, b); (−1, −1): w = (b, a); else w = (0, 0). E ≤ 0: s = 0 if px = py = 0 and pz > 0, else −√max(−(E + pz), 0); a = s; b = −h√(2|E|) if s = 0, else h·px/s + i·py/s; (h, ch) = (−1, +1): w = (a, b); (+1, −1): w = (b, a); else w = (0, 0)"#)),
+                ("weyl antiparticle", s(r#"E > 0: s = 0 if px = py = 0 and pz < 0, else −√max(E + pz, 0); a = s; b = −h√(2E) if s = 0, else −h·px/s + i·py/s; (h, ch) = (+1, +1): w = (b, a); (−1, −1): w = (a, b); else w = (0, 0). E ≤ 0: s = 0 if px = py = 0 and pz > 0, else √max(−(E + pz), 0); a = s; b = −h√(2|E|) if s = 0, else −h·px/s − i·py/s; (h, ch) = (−1, +1): w = (b, a); (+1, −1): w = (a, b); else w = (0, 0)"#)),
+                ("dirac particle", s(r#"|m| < 1e-8: a, b as for a weyl particle of the same E branch; E > 0: h = +1: w = (a, b, 0, 0), else (0, 0, b, a); E ≤ 0: h = −1: w = (a, b, 0, 0), else (0, 0, b, a). Massive: n = sign(E), nh = n·h; ω = (√(|E| + |k|), m / √(|E| + |k|)); f1 = (1 + n + (1 − n)·nh)/2, f2 = (1 + n − (1 − n)·nh)/2; ip = (1 + nh)/2, im = (1 − nh)/2 (indices 0, 1); g = (f1·ω[ip], f2·ω[im]); t = n·(px, py, pz); r = max(|k| + t_z, 0); χ = (1 if |k| = 0, else √(r / (2|k|)); −nh if r = 0 or |k| = 0, else (nh·t_x − i·t_y) / √(2|k| r)); w = (χ[im]·g[1], χ[ip]·g[1], χ[im]·g[0], χ[ip]·g[0])"#)),
+                ("dirac antiparticle", s(r#"|m| < 1e-8: a, b as for a weyl antiparticle of the same E branch; E > 0: h = −1: w = (0, 0, a, b), else (b, a, 0, 0); E ≤ 0: h = +1: w = (0, 0, a, b), else (b, a, 0, 0). Massive: as a dirac particle with n = −sign(E), χ[1] = nh·t_x + i·t_y over the same denominator, and w = (χ[im]·g[0], χ[ip]·g[0], χ[im]·g[1], χ[ip]·g[1])"#)),
+                ("vector (massless)", s(r#"m = 0 (gluon, photon). E > 0: w = (0, (−h·px·pz/(E·p_T) − i·py/p_T)/√2, (−h·py·pz/(E·p_T) + i·px/p_T)/√2, h·p_T/(E·√2)); for p_T = 0: w = (0, −h/√2, i·sign(pz)/√2, 0). E ≤ 0: with g = −h and P = −E: w = (0, (−g·px·pz/(P·p_T) + i·py/p_T)/√2, (−g·py·pz/(P·p_T) − i·px/p_T)/√2, g·p_T/(P·√2)); for p_T = 0: w = (0, −g/√2, −i·sign(pz)/√2, 0)"#)),
+                ("vector (massive)", s(r#"m ≠ 0 (Z, W). If E < 0: k → −k, h → −h first. P = min(E, |k|), q = min(P, p_T), l = 1 − |h| (1 for the longitudinal state), n = |h|; P = 0: w = (0, −h/√2, i·n/√2, l); else, with e = E/(m·P) and z = pz·h/(P·q·√2): w = (l·P/m, l·px·e − px·z − i·n·py/(q·√2), l·py·e − py·z + i·n·px/(q·√2), l·pz·e + h·q/(P·√2)); for q = 0 the middle two are −h/√2 and i·n·sign(pz)/√2"#)),
+            ]),
+        ),
+        (
             "output",
             s("outputs[h] = group_factor × Σ weight × |a|² over reduction[h]'s terms, in order (|a|² = fma(re, re, im × im)); the outputs are the \
                helicity configurations of output.helicities; the matrix element is Σ_h outputs[h]"),
