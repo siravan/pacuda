@@ -18,7 +18,12 @@ while args and args[0].startswith("--"):
         reuse = True
 procs = args
 t0 = time.time()
-if not (reuse and os.path.isdir(run_dir)):
+if reuse and not os.path.isdir(run_dir):
+    sys.exit(f"mg7_run: --reuse: {run_dir} does not exist")
+if not reuse:
+    if not procs:
+        sys.exit("mg7_run: no process to generate")
+    os.makedirs(os.path.dirname(run_dir), exist_ok=True)
     import madgraph.interface.master_interface as MGCmd
     from tests.acceptance_tests.test_mg7_amplicol import _edit_run_card
     mg = MGCmd.MasterCmd()
