@@ -162,6 +162,37 @@ fn write_json(path: &Path, v: &J) -> Result<()> {
 fn conventions() -> J {
     o(vec![
         ("complex", s("a complex number is [re, im]")),
+        (
+            "types",
+            o(vec![
+                ("p<l>", s("[f64; 4]: the momentum of external leg l, [E, px, py, pz]")),
+                ("q<i>", s("[f64; 4]: a momentum form, [E, px, py, pz]")),
+                ("forms[i].terms", s("Vec<(usize, f64)>: (leg, coefficient)")),
+                ("crossing", s("Option<Vec<{leg: usize, sign: f64}>>: per leg of the program, the caller's leg it reads and its sign")),
+                ("c<i>", s("[Complex<f64>; N], N = components: 1 scalar, 2 Weyl spinor, 4 vector or Dirac spinor, 6 antisymmetric tensor")),
+                ("c<i>[j]", s("Complex<f64>")),
+                ("a<i>", s("Complex<f64>: an amplitude")),
+                ("s<i>", s("Complex<f64>: a scale (a coupling or a mass; a mass and a kernel input use its real part, f64)")),
+                ("x<i>", s("Complex<f64>: an exact factor")),
+                ("currents[i].initial", s("\"zero\" | \"source\" | \"written\" | \"arena\"")),
+                (
+                    "currents[i].source",
+                    s("Option<{wavefunction: String, family: \"scalar\" | \"weyl\" | \"dirac\" | \"vector\", orientation: \"particle\" | \"antiparticle\", \
+                       leg: Option<usize>, momentum: q<i>, helicity: i32 (-1, 0, +1), chirality: i32 (-1, 0, +1), mass: s<i>, factor: x<i>}>: \
+                       present exactly when initial is \"source\""),
+                ),
+                ("bindings[i].inputs", s("[f64; n]: the kernel's inputs, each a real number (the re or im part of a complex operand)")),
+                ("bindings[i].outputs", s("[usize; m]: the components of out that the kernel's m output pairs (Complex<f64>) go to")),
+                ("reduction[h].terms", s("Vec<(a<i>, f64)>: (amplitude, weight)")),
+                ("outputs[h]", s("f64: the value of helicity configuration h, |M_h|² with its weights")),
+                ("output.group_factor", s("(i64, i64): numerator, denominator")),
+                ("output.helicities[h].legs", s("[i32; legs]: the helicity of each leg")),
+                ("inputs.alpha_s", s("Option<{name: String, value: f64, power: i32}>")),
+                ("examples: momenta", s("[[f64; 4]; legs]: the caller's momenta of one point")),
+                ("examples: outputs", s("[f64; helicities]")),
+                ("examples: total", s("f64")),
+            ]),
+        ),
         ("points", s("every program is evaluated per phase-space point; all values below are per point")),
         (
             "names",
@@ -182,7 +213,9 @@ fn conventions() -> J {
         ),
         (
             "initial",
-            s("a current's value before the body: 0, a wavefunction, or null (the body's first instruction writing it has mode \"=\")"),
+            s("a current's value before the body: \"zero\" (all components 0), \"source\" (the external wavefunction its `source` field \
+               describes), \"written\" (none: the body's first instruction writing it has mode \"=\"), \"arena\" (read before any \
+               instruction writes it: whatever its planes hold)"),
         ),
         (
             "output",
@@ -714,20 +747,25 @@ fn program_json(p: &Process, c: &Colour, helicity_ids: &[String], kernels: &[Str
             .iter()
             .enumerate()
             .map(|(k, cur)| {
-                o(vec![
+                let mut v = vec![
                     ("name", s(format!("c{k}"))),
                     ("components", u(cur.count)),
                     ("planes", J::A(vec![u(cur.base), u(cur.count)])),
                     ("momentum", cur.momentum.map_or(J::Null, |f| s(q(f)))),
                     (
                         "initial",
-                        match cur.init {
-                            Init::Zero | Init::Source(_) => initial.remove(&k).unwrap_or(J::Null),
-                            Init::Written => J::Null,
-                            Init::Arena => s("arena"),
-                        },
+                        s(match cur.init {
+                            Init::Zero => "zero",
+                            Init::Source(_) => "source",
+                            Init::Written => "written",
+                            Init::Arena => "arena",
+                        }),
                     ),
-                ])
+                ];
+                if let Init::Source(_) = cur.init {
+                    v.push(("source", initial.remove(&k).unwrap_or(J::Null)));
+                }
+                o(v)
             })
             .collect(),
     );
@@ -982,15 +1020,13 @@ fn read_program(v: &Value, parameters: &[(String, f64, f64)]) -> Result<(Process
     let mut rows = Vec::new();
     let mut zero: Vec<Option<Row>> = Vec::new();
     for (k, c) in currents.iter().enumerate() {
-        let init = get(c, "initial")?;
         let base = reader.current_base[k];
         zero.push(None);
-        if init.is_object() {
-            rows.push(source_row(base, init).with_context(|| format!("current c{k}"))?);
-        } else if init.as_u64() == Some(0) {
-            zero[k] = Some(Row::Clear { base, count: get_u32(c, "components")? });
-        } else if !(init.is_null() || init.as_str() == Some("arena")) {
-            bail!("current c{k}: initial {init}");
+        match get_str(c, "initial")? {
+            "source" => rows.push(source_row(base, get(c, "source")?).with_context(|| format!("current c{k}"))?),
+            "zero" => zero[k] = Some(Row::Clear { base, count: get_u32(c, "components")? }),
+            "written" | "arena" => {}
+            other => bail!("current c{k}: initial {other}"),
         }
     }
     let bindings = get_arr(v, "bindings")?;
