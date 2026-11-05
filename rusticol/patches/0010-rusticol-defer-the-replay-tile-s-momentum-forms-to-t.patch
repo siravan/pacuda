@@ -1,0 +1,603 @@
+From 5cfdccc7eb0b349df1ee8b179470beeb5c4fc203 Mon Sep 17 00:00:00 2001
+From: Shahriar Iravanian <siravan@svtsim.com>
+Date: Wed, 4 Nov 2026 15:40:35 -0500
+Subject: [PATCH 10/12] rusticol: defer the replay tile's momentum forms to the
+ pacman runner (local, e2e)
+
+When the runner fills the forms on the device (capability bit 1, with the sources there),
+execute_replay_tile_from_external_planes no longer fills them on the CPU: it records the
+external momenta and the selector's terms (permutation and momentum signs applied) for the
+hook, which passes them to the runner, or fills the forms on the CPU exactly as before when
+the plan run stays there. DirectWorkspace::momenta is now mutable for that fallback.
+Tiles of one point and observed runs keep the eager fill. PACMAN_RECURRENCE_GPU_FORMS=0
+disables it.
+---
+ .../src/recurrence/direct_backend.rs          |  38 ++++-
+ .../src/recurrence/direct_backend_pacman.rs   | 148 +++++++++++++++++-
+ .../src/recurrence/direct_backend_tests.rs    |  14 +-
+ .../src/recurrence/direct_runtime.rs          |  91 ++++++++++-
+ .../src/recurrence/direct_runtime_tests.rs    |   9 +-
+ .../src/recurrence/on_the_fly/persisted.rs    |   2 +-
+ 6 files changed, 286 insertions(+), 16 deletions(-)
+
+diff --git a/pyamplicol/rust/crates/rusticol-core/src/recurrence/direct_backend.rs b/pyamplicol/rust/crates/rusticol-core/src/recurrence/direct_backend.rs
+index 5343192e06..62508b37fa 100644
+--- a/pyamplicol/rust/crates/rusticol-core/src/recurrence/direct_backend.rs
++++ b/pyamplicol/rust/crates/rusticol-core/src/recurrence/direct_backend.rs
+@@ -41,6 +41,41 @@ pub(super) fn pacman_gpu_tile_points() -> RusticolResult<Option<u32>> {
+     pacman::gpu_tile_points()
+ }
+ 
++/// Forms on the device (feature `pacman`): the GPU runner fills the momentum forms itself from
++/// the external momenta, so the replay path may defer the CPU fill (`pacman_defer_forms`); the
++/// hook fills them on the CPU when it does not run the plan on the GPU.
++#[cfg(feature = "pacman")]
++pub(super) fn pacman_forms_on_device_available() -> bool {
++    pacman::forms_on_device_available()
++}
++
++#[cfg(feature = "pacman")]
++pub(super) fn pacman_defer_forms(
++    external: &[f64],
++    sources: u32,
++    points: u32,
++    form_terms: Vec<u32>,
++    slots: Vec<u32>,
++    coefficients: Vec<f64>,
++) {
++    pacman::defer_forms(external, sources, points, form_terms, slots, coefficients);
++}
++
++#[cfg(feature = "pacman")]
++pub(super) fn pacman_clear_deferred_forms() {
++    pacman::clear_deferred_forms();
++}
++
++#[cfg(feature = "pacman")]
++pub(super) fn pacman_forms_deferred_pending() -> bool {
++    pacman::deferred_forms_pending()
++}
++
++#[cfg(feature = "pacman")]
++pub(super) fn direct_observation_active() -> bool {
++    direct_current_observation_active()
++}
++
+ /// The amplitude planes cleared for the next plan run (the GPU zeroes them instead of uploading).
+ #[cfg(feature = "pacman")]
+ pub(super) fn pacman_note_cleared_amplitudes(ranges: &[std::ops::Range<usize>]) {
+@@ -3560,7 +3595,8 @@ pub struct DirectWorkspace<'a> {
+     pub current_im: &'a mut [f64],
+     pub amplitude_re: &'a mut [f64],
+     pub amplitude_im: &'a mut [f64],
+-    pub momenta: &'a [f64],
++    /// mutable so that a GPU runner hook can fill forms it was asked to defer
++    pub momenta: &'a mut [f64],
+     pub momentum_form_count: u32,
+     pub lorentz_component_count: u16,
+     pub parameters_re: &'a [f64],
+diff --git a/pyamplicol/rust/crates/rusticol-core/src/recurrence/direct_backend_pacman.rs b/pyamplicol/rust/crates/rusticol-core/src/recurrence/direct_backend_pacman.rs
+index c8ff41140d..7e1743b804 100644
+--- a/pyamplicol/rust/crates/rusticol-core/src/recurrence/direct_backend_pacman.rs
++++ b/pyamplicol/rust/crates/rusticol-core/src/recurrence/direct_backend_pacman.rs
+@@ -82,6 +82,9 @@ const CAP_SOURCES: u32 = 1;
+ const OP_SOURCE: u64 = 12;
+ const SOURCE_TEMPLATE_BITS: u8 = 10;
+ const GPU_SOURCES: &str = "PACMAN_RECURRENCE_GPU_SOURCES";
++const CAP_FORMS: u32 = 2;
++const FORMS_ON_DEVICE: u32 = 2;
++const GPU_FORMS: &str = "PACMAN_RECURRENCE_GPU_FORMS";
+ const REDUCE_SYMBOL: &[u8] = b"pacman_recurrence_v1_reduce\0";
+ const KEEP_AMPLITUDES: u32 = 1;
+ 
+@@ -220,6 +223,101 @@ struct RunnerCall {
+     zero_amplitude: *const u32,
+     zero_amplitude_runs: u32,
+     flags: u32,
++    // FORMS_ON_DEVICE: the forms are filled on the device from these (`momenta` is not read)
++    external_momenta: *const f64,
++    external_count: u32,
++    term_count: u32,
++    form_terms: *const u32,
++    term_slots: *const u32,
++    term_coefficients: *const f64,
++}
++
++/// The forms a replay tile deferred to the GPU (`defer_forms`): the external momenta
++/// (`[source][component][point]`, `points` per plane) and the selector's terms per form.
++struct DeferredForms {
++    external: *const f64,
++    external_len: usize,
++    sources: u32,
++    points: u32,
++    form_terms: Vec<u32>,
++    slots: Vec<u32>,
++    coefficients: Vec<f64>,
++}
++
++thread_local! {
++    static DEFERRED_FORMS: std::cell::RefCell<Option<DeferredForms>> =
++        const { std::cell::RefCell::new(None) };
++}
++
++/// Whether the runner fills the momentum forms (and the sources) on the device.
++pub(super) fn forms_on_device_available() -> bool {
++    matches!(runner(), Some(Ok(runner)) if runner.forms)
++}
++
++/// Defers this thread's next plan runs' momentum forms to the device. `external` must stay
++/// alive until `clear_deferred_forms` (the replay tile's call).
++pub(super) fn defer_forms(
++    external: &[f64],
++    sources: u32,
++    points: u32,
++    form_terms: Vec<u32>,
++    slots: Vec<u32>,
++    coefficients: Vec<f64>,
++) {
++    DEFERRED_FORMS.with(|deferred| {
++        *deferred.borrow_mut() = Some(DeferredForms {
++            external: external.as_ptr(),
++            external_len: external.len(),
++            sources,
++            points,
++            form_terms,
++            slots,
++            coefficients,
++        });
++    });
++}
++
++pub(super) fn clear_deferred_forms() {
++    DEFERRED_FORMS.with(|deferred| *deferred.borrow_mut() = None);
++}
++
++pub(super) fn deferred_forms_pending() -> bool {
++    DEFERRED_FORMS.with(|deferred| deferred.borrow().is_some())
++}
++
++/// The deferred forms on the CPU, as `fill_momentum_form_from_external` fills them (term order:
++/// `0.0 + c * p`, then `+= c * p`; no term: 0), when the plan run does not go to the GPU. They
++/// are no longer deferred afterwards.
++fn fill_deferred_forms_on_host(workspace: &mut DirectWorkspace<'_>) {
++    let Some(forms) = DEFERRED_FORMS.with(|deferred| deferred.borrow_mut().take()) else {
++        return;
++    };
++    // SAFETY: the replay tile that deferred the forms keeps `external` alive until it clears them
++    let external = unsafe { std::slice::from_raw_parts(forms.external, forms.external_len) };
++    let points = forms.points as usize;
++    let stride = workspace.point_stride as usize;
++    for (form, range) in forms.form_terms.chunks_exact(2).enumerate() {
++        let (first, count) = (range[0] as usize, range[1] as usize);
++        for component in 0..4 {
++            let start = (form * 4 + component) * stride;
++            let plane = &mut workspace.momenta[start..start + points];
++            if count == 0 {
++                plane.fill(0.0);
++                continue;
++            }
++            for term in first..first + count {
++                let (slot, coefficient) = (forms.slots[term] as usize, forms.coefficients[term]);
++                let input = &external[(slot * 4 + component) * points..][..points];
++                for (value, source) in plane.iter_mut().zip(input) {
++                    if term == first {
++                        *value = 0.0 + coefficient * source;
++                    } else {
++                        *value += coefficient * source;
++                    }
++                }
++            }
++        }
++    }
+ }
+ 
+ type RunFunction = unsafe extern "C" fn(*const RunnerCall) -> i32;
+@@ -229,6 +327,8 @@ struct Runner {
+     reduce: Option<ReduceFunction>,
+     /// the library evaluates source rows (and `PACMAN_RECURRENCE_GPU_SOURCES` is not 0)
+     sources: bool,
++    /// it also fills the momentum forms (with the sources; `PACMAN_RECURRENCE_GPU_FORMS` not 0)
++    forms: bool,
+     whole: bool,
+     _library: libloading::Library,
+ }
+@@ -261,11 +361,15 @@ fn runner() -> Option<&'static Result<Runner, String>> {
+                     .map_or(0, |capabilities| unsafe { (*capabilities)() });
+                 let sources = capabilities & CAP_SOURCES != 0
+                     && std::env::var_os(GPU_SOURCES).is_none_or(|value| value != "0");
++                let forms = sources
++                    && capabilities & CAP_FORMS != 0
++                    && std::env::var_os(GPU_FORMS).is_none_or(|value| value != "0");
+                 eprintln!("pacman: {RUNNER}: {}", path.to_string_lossy());
+                 Ok(Runner {
+                     run,
+                     reduce,
+                     sources,
++                    forms,
+                     whole: std::env::var_os(WHOLE).is_some_and(|value| value != "0"),
+                     _library: library,
+                 })
+@@ -418,10 +522,20 @@ pub(super) fn try_execute<const PREPARED_CLEARS: bool>(
+             })
+             .clone()
+     };
+-    let encoded = encoded.ok()?;
++    let Ok(encoded) = encoded else {
++        // the plan run stays on the CPU: it reads the forms there
++        fill_deferred_forms_on_host(workspace);
++        return None;
++    };
++    // the forms on the device only with the sources there (the CPU sources read the forms)
++    let device_forms = encoded.gpu_sources && runner.forms && deferred_forms_pending();
++    if !device_forms {
++        fill_deferred_forms_on_host(workspace);
++    }
+     Some(execute(
+         runner,
+         &encoded,
++        device_forms,
+         plan,
+         row_groups,
+         executors,
+@@ -748,6 +862,7 @@ fn encode<const PREPARED_CLEARS: bool>(
+ fn execute(
+     runner: &Runner,
+     encoded: &Encoded,
++    device_forms: bool,
+     plan: &DirectRecurrencePlan,
+     row_groups: &[DirectRowGroupDescriptor],
+     executors: &DirectExecutorCatalog,
+@@ -891,8 +1006,37 @@ fn execute(
+         points: point_count,
+         zero_amplitude: zero_amplitude.as_ptr(),
+         zero_amplitude_runs: (zero_amplitude.len() / 2) as u32,
+-        flags: if keep { KEEP_AMPLITUDES } else { 0 },
++        flags: (if keep { KEEP_AMPLITUDES } else { 0 }) | (if device_forms { FORMS_ON_DEVICE } else { 0 }),
++        external_momenta: std::ptr::null(),
++        external_count: 0,
++        term_count: 0,
++        form_terms: std::ptr::null(),
++        term_slots: std::ptr::null(),
++        term_coefficients: std::ptr::null(),
+     };
++    // the deferred forms' tables stay borrowed (and alive) during the call
++    let deferred = DEFERRED_FORMS.with(|deferred| {
++        deferred.borrow().as_ref().map(|forms| {
++            (forms.external, forms.sources, forms.slots.len() as u32, forms.form_terms.as_ptr(),
++             forms.slots.as_ptr(), forms.coefficients.as_ptr(), forms.points)
++        })
++    });
++    let mut call = call;
++    if device_forms {
++        let Some((external, sources, terms, form_terms, slots, coefficients, points)) = deferred
++        else {
++            return Err(RusticolError::integrity("device momentum forms without deferred forms"));
++        };
++        if points != point_count {
++            return Err(RusticolError::integrity("deferred momentum forms have another point count"));
++        }
++        call.external_momenta = external;
++        call.external_count = sources;
++        call.term_count = terms;
++        call.form_terms = form_terms;
++        call.term_slots = slots;
++        call.term_coefficients = coefficients;
++    }
+     dump_once(
+         &call,
+         &scale_re,
+diff --git a/pyamplicol/rust/crates/rusticol-core/src/recurrence/direct_backend_tests.rs b/pyamplicol/rust/crates/rusticol-core/src/recurrence/direct_backend_tests.rs
+index 8c2afba696..8f24e257fc 100644
+--- a/pyamplicol/rust/crates/rusticol-core/src/recurrence/direct_backend_tests.rs
++++ b/pyamplicol/rust/crates/rusticol-core/src/recurrence/direct_backend_tests.rs
+@@ -277,7 +277,7 @@ fn synthetic_program_reads_rows_and_accumulates_directly_into_arenas() {
+     let mut current_im = [0.0; 8];
+     let mut amplitude_re = [0.0; 4];
+     let mut amplitude_im = [0.0; 4];
+-    let momenta = [1.0, 2.0, 3.0, 4.0];
++    let mut momenta = [1.0, 2.0, 3.0, 4.0];
+     let parameters_re = [3.0];
+     let parameters_im = [0.0];
+     let factors_re = [2.0, 0.5, -1.0];
+@@ -287,7 +287,7 @@ fn synthetic_program_reads_rows_and_accumulates_directly_into_arenas() {
+         current_im: &mut current_im,
+         amplitude_re: &mut amplitude_re,
+         amplitude_im: &mut amplitude_im,
+-        momenta: &momenta,
++        momenta: &mut momenta,
+         momentum_form_count: 1,
+         lorentz_component_count: 1,
+         parameters_re: &parameters_re,
+@@ -306,7 +306,7 @@ fn synthetic_program_reads_rows_and_accumulates_directly_into_arenas() {
+ 
+     assert_eq!(workspace.current_re.as_ptr(), current_re_pointer);
+     assert_eq!(workspace.amplitude_re.as_ptr(), amplitude_re_pointer);
+-    assert_eq!(workspace.current_re[0..4], momenta);
++    assert_eq!(workspace.current_re[0..4], [1.0, 2.0, 3.0, 4.0]);
+     assert_eq!(workspace.current_re[4..8], [3.0, 6.0, 9.0, 12.0]);
+     assert_eq!(workspace.amplitude_re, &[-3.0, -6.0, -9.0, -12.0]);
+     assert!(workspace.current_im.iter().all(|value| *value == 0.0));
+@@ -400,7 +400,7 @@ fn certified_reuse_row_scale_copies_without_calling_an_interaction_executor() {
+     let mut current_im = [0.0; 12];
+     let mut amplitude_re = [0.0; 4];
+     let mut amplitude_im = [0.0; 4];
+-    let momenta = [1.0, 2.0, 3.0, 4.0];
++    let mut momenta = [1.0, 2.0, 3.0, 4.0];
+     let parameters_re = [1.0];
+     let parameters_im = [0.0];
+     let factors_re = [2.0, 1.0];
+@@ -410,7 +410,7 @@ fn certified_reuse_row_scale_copies_without_calling_an_interaction_executor() {
+         current_im: &mut current_im,
+         amplitude_re: &mut amplitude_re,
+         amplitude_im: &mut amplitude_im,
+-        momenta: &momenta,
++        momenta: &mut momenta,
+         momentum_form_count: 1,
+         lorentz_component_count: 1,
+         parameters_re: &parameters_re,
+@@ -479,7 +479,7 @@ fn zero_self_reuse_clears_stale_destination_before_scale_copy() {
+     let mut current_im = [f64::NAN; 12];
+     let mut amplitude_re = [0.0; 4];
+     let mut amplitude_im = [0.0; 4];
+-    let momenta = [1.0, 2.0, 3.0, 4.0];
++    let mut momenta = [1.0, 2.0, 3.0, 4.0];
+     let parameters_re = [1.0];
+     let parameters_im = [0.0];
+     let factors_re = [0.0, 1.0];
+@@ -489,7 +489,7 @@ fn zero_self_reuse_clears_stale_destination_before_scale_copy() {
+         current_im: &mut current_im,
+         amplitude_re: &mut amplitude_re,
+         amplitude_im: &mut amplitude_im,
+-        momenta: &momenta,
++        momenta: &mut momenta,
+         momentum_form_count: 1,
+         lorentz_component_count: 1,
+         parameters_re: &parameters_re,
+diff --git a/pyamplicol/rust/crates/rusticol-core/src/recurrence/direct_runtime.rs b/pyamplicol/rust/crates/rusticol-core/src/recurrence/direct_runtime.rs
+index d12d5c149d..b94091b2f4 100644
+--- a/pyamplicol/rust/crates/rusticol-core/src/recurrence/direct_runtime.rs
++++ b/pyamplicol/rust/crates/rusticol-core/src/recurrence/direct_runtime.rs
+@@ -390,6 +390,9 @@ pub struct DirectRecurrenceExecutionRuntime {
+     momenta_are_compact: bool,
+     momentum_filled_points: u32,
+     momentum_replay_selector: Option<DirectReplaySelectorIdentity>,
++    /// the replay tile's forms were deferred to the GPU runner (feature `pacman`): the host
++    /// forms are not filled, only the runner (or its CPU fallback) fills them
++    momentum_forms_deferred: bool,
+     last_point_count: u32,
+     last_public_flow_id: Option<u32>,
+     last_representative_flow_id: Option<u32>,
+@@ -605,6 +608,7 @@ impl DirectRecurrenceExecutionRuntime {
+             momenta_are_compact: false,
+             momentum_filled_points: 0,
+             momentum_replay_selector: None,
++            momentum_forms_deferred: false,
+             last_point_count: 0,
+             last_public_flow_id: None,
+             last_representative_flow_id: None,
+@@ -875,6 +879,7 @@ impl DirectRecurrenceExecutionRuntime {
+         self.force_tiled_layout()?;
+         self.compact_momenta_for_legacy_access();
+         self.momentum_filled_points = self.tile_capacity;
++        self.momentum_forms_deferred = false;
+         self.momentum_replay_selector = None;
+         let compact_len = self.compact_momentum_len();
+         Ok(&mut self.momenta.as_mut_slice()[..compact_len])
+@@ -888,6 +893,7 @@ impl DirectRecurrenceExecutionRuntime {
+         self.force_tiled_layout()?;
+         self.restore_physical_momenta();
+         self.momentum_filled_points = self.tile_capacity;
++        self.momentum_forms_deferred = false;
+         self.momentum_replay_selector = None;
+         Ok(self.momenta.as_mut_slice())
+     }
+@@ -908,6 +914,7 @@ impl DirectRecurrenceExecutionRuntime {
+         self.force_tiled_layout()?;
+         self.compact_momenta_for_legacy_access();
+         self.momentum_filled_points = self.tile_capacity;
++        self.momentum_forms_deferred = false;
+         self.momentum_replay_selector = None;
+         let plane = momentum_form_id as usize * usize::from(self.lorentz_component_count)
+             + usize::from(lorentz_component);
+@@ -1014,6 +1021,7 @@ impl DirectRecurrenceExecutionRuntime {
+         }
+ 
+         self.momentum_filled_points = point_count;
++        self.momentum_forms_deferred = false;
+         self.momentum_replay_selector = Some(selector.identity());
+         if PROFILE {
+             self.activity_counters.momentum_fill_calls =
+@@ -1040,6 +1048,66 @@ impl DirectRecurrenceExecutionRuntime {
+         Ok(())
+     }
+ 
++    /// `fill_momenta_from_external_impl::<_, true>` for the GPU runner: the same checks and
++    /// layout, but the forms are left to the runner (`pacman_defer_forms`: the selector's terms,
++    /// source permutation and momentum signs applied as the CPU fill applies them).
++    #[cfg(feature = "pacman")]
++    fn defer_momenta_from_external(
++        &mut self,
++        selector: &DirectReplaySelectorPlan,
++        point_count: u32,
++        external_four_momenta: &[f64],
++    ) -> RusticolResult<()> {
++        self.validate_replay_selector(selector)?;
++        self.validate_point_count(point_count)?;
++        if self.lorentz_component_count != 4 {
++            return Err(invalid(format!(
++                "external four-momentum fill requires 4 Lorentz components, runtime has {}",
++                self.lorentz_component_count
++            )));
++        }
++        let source_count = usize::try_from(self.plan.external_source_count())
++            .map_err(|_| invalid("external source count exceeds usize"))?;
++        let expected_len = (point_count as usize)
++            .checked_mul(source_count)
++            .and_then(|values| values.checked_mul(4))
++            .ok_or_else(|| invalid("point-major external momentum length overflows usize"))?;
++        if external_four_momenta.len() != expected_len {
++            return Err(invalid(format!(
++                "point-major external momentum length is {}, expected {expected_len}",
++                external_four_momenta.len()
++            )));
++        }
++        self.activate_point_layout(point_count)?;
++        self.restore_physical_momenta();
++        let terms = self.plan.momentum_terms();
++        let mut form_terms = Vec::with_capacity(2 * self.plan.momentum_forms().len());
++        let (mut slots, mut coefficients) = (Vec::new(), Vec::new());
++        for form in self.plan.momentum_forms() {
++            let term_start = form.term_start as usize;
++            form_terms.push(slots.len() as u32);
++            form_terms.push(form.term_count);
++            for term in &terms[term_start..term_start + form.term_count as usize] {
++                let slot = term.source_slot as usize;
++                slots.push(selector.source_permutation[slot]);
++                coefficients
++                    .push(f64::from(term.coefficient) * f64::from(selector.source_momentum_signs[slot]));
++            }
++        }
++        super::direct_backend::pacman_defer_forms(
++            external_four_momenta,
++            source_count as u32,
++            point_count,
++            form_terms,
++            slots,
++            coefficients,
++        );
++        self.momentum_filled_points = point_count;
++        self.momentum_replay_selector = Some(selector.identity());
++        self.momentum_forms_deferred = true;
++        Ok(())
++    }
++
+     /// Fill canonical momentum forms without a replay permutation.
+     fn fill_identity_momenta_from_external<const PROFILE: bool, const SOURCE_MAJOR: bool>(
+         &mut self,
+@@ -1104,6 +1172,7 @@ impl DirectRecurrenceExecutionRuntime {
+         }
+ 
+         self.momentum_filled_points = point_count;
++        self.momentum_forms_deferred = false;
+         self.momentum_replay_selector = None;
+         if PROFILE {
+             self.activity_counters.momentum_fill_calls =
+@@ -1267,6 +1336,12 @@ impl DirectRecurrenceExecutionRuntime {
+                 "replay tile momentum forms were not filled for this selector and point count",
+             ));
+         }
++        #[cfg(feature = "pacman")]
++        if self.momentum_forms_deferred && !super::direct_backend::pacman_forms_deferred_pending() {
++            return Err(invalid(
++                "replay tile momentum forms were deferred to the GPU runner and are not filled",
++            ));
++        }
+ 
+         self.execute_selected_direct_tile_impl::<PROFILE>(selector, point_count)?;
+         self.scale_replay_amplitudes::<PROFILE>(
+@@ -1378,6 +1453,18 @@ impl DirectRecurrenceExecutionRuntime {
+         point_count: u32,
+         external_four_momenta: &[f64],
+     ) -> RusticolResult<DirectRecurrenceTileOutput<'_>> {
++        // the GPU runner fills the forms itself (or its hook does on the CPU when the plan run
++        // stays there): the CPU fill is deferred
++        #[cfg(feature = "pacman")]
++        if point_count >= 2
++            && !super::direct_backend::direct_observation_active()
++            && super::direct_backend::pacman_forms_on_device_available()
++        {
++            self.defer_momenta_from_external(selector, point_count, external_four_momenta)?;
++            let result = self.execute_replay_tile_impl::<PROFILE>(selector, point_count);
++            super::direct_backend::pacman_clear_deferred_forms();
++            return result;
++        }
+         self.fill_momenta_from_external_impl::<PROFILE, true>(
+             selector,
+             point_count,
+@@ -1686,7 +1773,7 @@ impl DirectRecurrenceExecutionRuntime {
+                 current_im,
+                 amplitude_re,
+                 amplitude_im,
+-                momenta: self.momenta.as_slice(),
++                momenta: self.momenta.as_mut_slice(),
+                 momentum_form_count: self.momentum_form_count,
+                 lorentz_component_count: self.lorentz_component_count,
+                 parameters_re: self.parameters_re.as_slice(),
+@@ -1843,6 +1930,7 @@ impl DirectRecurrenceExecutionRuntime {
+                 .flatten();
+             self.swap_point_storage();
+             self.momentum_filled_points = u32::from(exact_singleton || legacy_full_tile);
++            self.momentum_forms_deferred = false;
+             self.momentum_replay_selector = replay_selector;
+             return Ok(());
+         }
+@@ -1931,6 +2019,7 @@ impl DirectRecurrenceExecutionRuntime {
+         self.point_stride = self.arena.point_stride();
+         self.momenta_are_compact = false;
+         self.momentum_filled_points = 0;
++        self.momentum_forms_deferred = false;
+         self.momentum_replay_selector = None;
+         self.packed_singleton_active = !self.packed_singleton_active;
+         self.last_point_count = 0;
+diff --git a/pyamplicol/rust/crates/rusticol-core/src/recurrence/direct_runtime_tests.rs b/pyamplicol/rust/crates/rusticol-core/src/recurrence/direct_runtime_tests.rs
+index 5828acc188..07562dc8c4 100644
+--- a/pyamplicol/rust/crates/rusticol-core/src/recurrence/direct_runtime_tests.rs
++++ b/pyamplicol/rust/crates/rusticol-core/src/recurrence/direct_runtime_tests.rs
+@@ -919,12 +919,13 @@ fn direct_baseline(
+         .iter()
+         .map(|factor| factor.imag().numerator() as f64 / factor.imag().denominator() as f64)
+         .collect::<Vec<_>>();
++    let mut momenta = momenta.to_vec();
+     let mut workspace = DirectWorkspace {
+         current_re: &mut current_re,
+         current_im: &mut current_im,
+         amplitude_re: &mut amplitude_re,
+         amplitude_im: &mut amplitude_im,
+-        momenta,
++        momenta: &mut momenta,
+         momentum_form_count: plan.momentum_forms().len() as u32,
+         lorentz_component_count: 1,
+         parameters_re: &[parameter.0],
+@@ -1132,7 +1133,7 @@ fn full_fanout_execution_overwrites_poisoned_destination_without_stage_clear() {
+     let plan = fanout_test_plan();
+     let point_stride = 8_u32;
+     let point_count = 7_u32;
+-    let momenta = [0.125, -0.875, 1.75, -3.5, 0.0625, 7.25, -11.0, 0.0];
++    let mut momenta = [0.125, -0.875, 1.75, -3.5, 0.0625, 7.25, -11.0, 0.0];
+     let parameter = (0.375, -1.125);
+     let census = ContributionCallCensus::default();
+     let catalog = fanout_test_catalog(&plan, &census, false);
+@@ -1155,7 +1156,7 @@ fn full_fanout_execution_overwrites_poisoned_destination_without_stage_clear() {
+     factors_re.push(1.0);
+     factors_im.push(0.0);
+ 
+-    let execute = |current_re: &mut [f64],
++    let mut execute = |current_re: &mut [f64],
+                    current_im: &mut [f64],
+                    amplitude_re: &mut [f64],
+                    amplitude_im: &mut [f64]| {
+@@ -1164,7 +1165,7 @@ fn full_fanout_execution_overwrites_poisoned_destination_without_stage_clear() {
+             current_im,
+             amplitude_re,
+             amplitude_im,
+-            momenta: &momenta,
++            momenta: &mut momenta,
+             momentum_form_count: plan.momentum_forms().len() as u32,
+             lorentz_component_count: 1,
+             parameters_re: &[parameter.0],
+diff --git a/pyamplicol/rust/crates/rusticol-core/src/recurrence/on_the_fly/persisted.rs b/pyamplicol/rust/crates/rusticol-core/src/recurrence/on_the_fly/persisted.rs
+index 27e8f826f6..52c01d9d4f 100644
+--- a/pyamplicol/rust/crates/rusticol-core/src/recurrence/on_the_fly/persisted.rs
++++ b/pyamplicol/rust/crates/rusticol-core/src/recurrence/on_the_fly/persisted.rs
+@@ -577,7 +577,7 @@ impl PersistedHelicityWorkspaceV1 {
+             current_im: self.current_im.as_mut_slice(),
+             amplitude_re: self.amplitude_re.as_mut_slice(),
+             amplitude_im: self.amplitude_im.as_mut_slice(),
+-            momenta: self.momenta.as_slice(),
++            momenta: self.momenta.as_mut_slice(),
+             momentum_form_count: layout.momentum_forms.len() as u32,
+             lorentz_component_count: layout.lorentz_component_count,
+             parameters_re: self.parameters_re.as_slice(),
+-- 
+2.43.0
+

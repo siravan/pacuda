@@ -1,0 +1,152 @@
+From d60d337ff637da9e68a2945919643dd65d5cd906 Mon Sep 17 00:00:00 2001
+From: Shahriar Iravanian <siravan@svtsim.com>
+Date: Wed, 4 Nov 2026 15:17:19 -0500
+Subject: [PATCH 09/12] rusticol: test the pacman runner's device sources
+ against wavefunctions.rs (local, e2e)
+
+---
+ .../rust/crates/rusticol-core/src/engine.rs   | 128 ++++++++++++++++++
+ 1 file changed, 128 insertions(+)
+
+diff --git a/pyamplicol/rust/crates/rusticol-core/src/engine.rs b/pyamplicol/rust/crates/rusticol-core/src/engine.rs
+index b3c831198d..8c4e0acea2 100644
+--- a/pyamplicol/rust/crates/rusticol-core/src/engine.rs
++++ b/pyamplicol/rust/crates/rusticol-core/src/engine.rs
+@@ -4867,6 +4867,134 @@ use evaluator::*;
+ mod wavefunctions;
+ use wavefunctions::*;
+ 
++/// The pacman recurrence runner's device sources (op 12) against `wavefunctions.rs`, bit for
++/// bit, through its test entry `pacman_recurrence_v1_test_sources`. Runs when
++/// `PACMAN_RECURRENCE_RUNNER` names a runner library with a usable GPU; skipped otherwise.
++#[cfg(all(test, feature = "pacman"))]
++mod pacman_source_tests {
++    use super::wavefunctions::*;
++    use num_complex::Complex;
++
++    type TestSources = unsafe extern "C" fn(
++        *const u32,
++        *const f64,
++        *const f64,
++        u32,
++        *mut f64,
++        *mut f64,
++    ) -> i32;
++
++    fn code(family: u32, orientation: u32, helicity: i32, chirality: i32) -> u32 {
++        family | orientation << 3 | ((helicity + 2) as u32) << 5 | ((chirality + 1) as u32) << 8
++    }
++
++    // as `execute_direct_source_rows`
++    fn reference(family: u32, orientation: u32, helicity: i32, chirality: i32, mass: f64, p: [f64; 4]) -> Vec<Complex<f64>> {
++        match family {
++            0 => vec![Complex::new(1.0, 0.0)],
++            1 if orientation == 0 => ext_quark_weyl_array(p, helicity, chirality).to_vec(),
++            1 => ext_antiquark_weyl_array(p, helicity, chirality).to_vec(),
++            2 if orientation == 0 => ext_quark_dirac_massive(p, helicity, mass).to_vec(),
++            2 => ext_antiquark_dirac_massive(p, helicity, mass).to_vec(),
++            _ if mass == 0.0 => ext_gluon(p, helicity).to_vec(),
++            _ => ext_massive_vector(p, helicity, mass).to_vec(),
++        }
++    }
++
++    #[test]
++    fn pacman_device_sources_equal_wavefunctions() {
++        let Some(path) = std::env::var_os("PACMAN_RECURRENCE_RUNNER").filter(|v| !v.is_empty()) else {
++            eprintln!("PACMAN_RECURRENCE_RUNNER is not set: skipped");
++            return;
++        };
++        let library = unsafe { libloading::Library::new(&path) }.expect("the runner library");
++        let test: TestSources =
++            *unsafe { library.get::<TestSources>(b"pacman_recurrence_v1_test_sources\0") }.expect("a test entry");
++        // momenta: random directions, massless or on-shell massive, both energy signs, and the
++        // beam axis (px = py = 0) with pz of either sign
++        let mut state = 0x9e37_79b9_7f4a_7c15u64;
++        let mut uniform = move || {
++            state ^= state << 13;
++            state ^= state >> 7;
++            state ^= state << 17;
++            (state >> 11) as f64 / (1u64 << 53) as f64
++        };
++        let mut momenta_for = |mass: f64| -> Vec<[f64; 4]> {
++            let mut out = Vec::new();
++            for k in 0..40 {
++                let (px, py, pz) = if k < 4 {
++                    (0.0, 0.0, if k % 2 == 0 { 250.0 } else { -250.0 })
++                } else {
++                    let r = 1.0 + 499.0 * uniform();
++                    let c = 2.0 * uniform() - 1.0;
++                    let s = (1.0 - c * c).sqrt();
++                    let f = 2.0 * std::f64::consts::PI * uniform();
++                    (r * s * f.cos(), r * s * f.sin(), r * c)
++                };
++                let e = (px * px + py * py + pz * pz + mass * mass).sqrt();
++                out.push([e, px, py, pz]);
++                out.push([-e, -px, -py, -pz]);
++            }
++            out
++        };
++        let mut cases: Vec<(u32, u32, i32, i32, f64)> = vec![(0, 0, 0, 0, 0.0)];
++        for orientation in 0..2 {
++            for helicity in [-1, 1] {
++                for chirality in [-1, 1] {
++                    cases.push((1, orientation, helicity, chirality, 0.0));
++                }
++                for mass in [0.0, 1.0e-9, 4.7, 173.0] {
++                    cases.push((2, orientation, helicity, 0, mass));
++                }
++            }
++        }
++        for helicity in [-1, 0, 1] {
++            for mass in [0.0, 80.379, 91.1876] {
++                if helicity == 0 && mass == 0.0 {
++                    continue;
++                }
++                cases.push((3, 0, helicity, 0, mass));
++            }
++        }
++        let (mut codes, mut masses, mut flat, mut expected) = (vec![], vec![], vec![], vec![]);
++        for &(family, orientation, helicity, chirality, mass) in &cases {
++            for p in momenta_for(mass) {
++                codes.push(code(family, orientation, helicity, chirality));
++                masses.push(mass);
++                flat.extend_from_slice(&p);
++                expected.push((family, orientation, helicity, chirality, mass, p,
++                               reference(family, orientation, helicity, chirality, mass, p)));
++            }
++        }
++        let count = codes.len();
++        let (mut re, mut im) = (vec![0.0; 4 * count], vec![0.0; 4 * count]);
++        let status = unsafe {
++            test(codes.as_ptr(), masses.as_ptr(), flat.as_ptr(), count as u32, re.as_mut_ptr(), im.as_mut_ptr())
++        };
++        if status != 0 {
++            eprintln!("the runner could not run on a GPU (status {status}): skipped");
++            return;
++        }
++        let mut mismatches = 0;
++        for (i, (family, orientation, helicity, chirality, mass, p, wave)) in expected.iter().enumerate() {
++            for (k, value) in wave.iter().enumerate() {
++                let (gr, gi) = (re[4 * i + k], im[4 * i + k]);
++                if gr.to_bits() != value.re.to_bits() || gi.to_bits() != value.im.to_bits() {
++                    if mismatches < 20 {
++                        eprintln!(
++                            "family {family} orientation {orientation} helicity {helicity} chirality {chirality} mass {mass} p {p:?} component {k}: device ({gr:e}, {gi:e}) cpu ({:e}, {:e})",
++                            value.re, value.im
++                        );
++                    }
++                    mismatches += 1;
++                }
++            }
++        }
++        eprintln!("{count} sources compared, {mismatches} components differ");
++        assert_eq!(mismatches, 0);
++    }
++}
++
+ #[cfg(test)]
+ #[path = "engine_tests.rs"]
+ mod tests;
+-- 
+2.43.0
+

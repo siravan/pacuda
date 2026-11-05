@@ -1,0 +1,151 @@
+From fdf27797512099c3e030faaf550b0d76d878df7a Mon Sep 17 00:00:00 2001
+From: Shahriar Iravanian <siravan@svtsim.com>
+Date: Tue, 3 Nov 2026 21:33:20 -0500
+Subject: [PATCH 06/12] rusticol: pacman recurrence runner keys its programs by
+ content (local, e2e)
+
+Every UMAMI library links its own copy of RustiCol, and all copies in a process share
+one librecurrence.so. The words key was a per-copy counter (cache.len() + 1), so the
+LC and the reweight library gave different programs the same key and the runner ran
+the other copy's rows: wrong matrix elements in mg7 (pp > jjj +22%). The key is now a
+hash of the words and their widths. The encoding cache is also keyed by the row groups'
+and clears' contents and the plan's layout digest instead of their addresses.
+---
+ .../src/recurrence/direct_backend_pacman.rs   | 78 +++++++++++++++----
+ 1 file changed, 65 insertions(+), 13 deletions(-)
+
+diff --git a/pyamplicol/rust/crates/rusticol-core/src/recurrence/direct_backend_pacman.rs b/pyamplicol/rust/crates/rusticol-core/src/recurrence/direct_backend_pacman.rs
+index 6722485fee..ba45474bda 100644
+--- a/pyamplicol/rust/crates/rusticol-core/src/recurrence/direct_backend_pacman.rs
++++ b/pyamplicol/rust/crates/rusticol-core/src/recurrence/direct_backend_pacman.rs
+@@ -253,18 +253,66 @@ struct Encoded {
+     amplitudes: Box<[u32]>,
+ }
+ 
+-/// What makes a plan run's words: the plan, the row groups and the clears.
+-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
++/// What makes a plan run's words: the plan, the row groups and the clears, by value.
++/// (Keyed by address before: a selector's row groups or clear stages freed and another
++/// one allocated at the same address with the same length then reused the stale words,
++/// and the GPU ran rows of another selection: wrong values in mg7's interleaved calls.)
++#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+ struct Key {
+-    plan: usize,
+-    row_groups: usize,
+-    row_group_count: usize,
++    plan: crate::recurrence::SemanticDigest,
++    /// current planes, amplitude planes, momentum forms, factors
++    arena: [usize; 4],
++    /// per row group: stage, role, destination operation, executor, first row, row count
++    row_groups: Box<[u64]>,
+     selected_sector_id: Option<u32>,
+-    clear_stages: Option<usize>,
++    /// per stage: stage, range count, then (component base, count) per range
++    clear_stages: Option<Box<[u64]>>,
+     requires_stage_clear: bool,
+     prepared_clears: bool,
+ }
+ 
++/// The runner caches a program per `words_key`. Every UMAMI library links its own
++/// copy of RustiCol, and all copies in a process share one runner library, so a
++/// per-copy counter (as before) gave different programs the same key: the runner then
++/// ran another copy's rows. A hash of what the program is made of (the words and their
++/// widths) is the same for the same program in every copy and differs otherwise.
++fn words_key(words: &[u64], width: &[u8; 8]) -> u64 {
++    use std::hash::{Hash, Hasher};
++    let mut hasher = std::collections::hash_map::DefaultHasher::new();
++    width.hash(&mut hasher);
++    words.len().hash(&mut hasher);
++    words.hash(&mut hasher);
++    hasher.finish().max(1) // 0 means "do not cache"
++}
++
++fn row_group_words(row_groups: &[DirectRowGroupDescriptor]) -> Box<[u64]> {
++    let mut words = Vec::with_capacity(row_groups.len() * 6);
++    for group in row_groups {
++        words.extend_from_slice(&[
++            u64::from(group.stage),
++            group.role as u16 as u64,
++            group.destination_operation as u16 as u64,
++            u64::from(group.direct_executor_id),
++            group.row_start,
++            u64::from(group.row_count),
++        ]);
++    }
++    words.into_boxed_slice()
++}
++
++fn clear_stage_words(stages: &[DirectStageClearRanges]) -> Box<[u64]> {
++    let mut words = Vec::new();
++    for stage in stages {
++        words.push(u64::from(stage.stage));
++        words.push(stage.ranges.len() as u64);
++        for range in stage.ranges.iter() {
++            words.push(u64::from(range.component_base));
++            words.push(u64::from(range.component_count));
++        }
++    }
++    words.into_boxed_slice()
++}
++
+ type Cache = HashMap<Key, Result<Arc<Encoded>, String>>;
+ 
+ fn cache() -> &'static Mutex<Cache> {
+@@ -289,12 +337,18 @@ pub(super) fn try_execute<const PREPARED_CLEARS: bool>(
+         Ok(runner) => runner,
+         Err(message) => return Some(Err(RusticolError::evaluation(message.clone()))),
+     };
++    let stride = (workspace.point_stride as usize).max(1);
+     let key = Key {
+-        plan: std::ptr::from_ref(plan) as usize,
+-        row_groups: row_groups.as_ptr() as usize,
+-        row_group_count: row_groups.len(),
++        plan: plan.runtime_layout_digest(),
++        arena: [
++            workspace.current_re.len() / stride,
++            workspace.amplitude_re.len() / stride,
++            workspace.momentum_form_count as usize,
++            workspace.factors_re.len(),
++        ],
++        row_groups: row_group_words(row_groups),
+         selected_sector_id,
+-        clear_stages: current_clear_stages.map(|stages| stages.as_ptr() as usize),
++        clear_stages: current_clear_stages.map(clear_stage_words),
+         requires_stage_clear,
+         prepared_clears: PREPARED_CLEARS,
+     };
+@@ -302,7 +356,6 @@ pub(super) fn try_execute<const PREPARED_CLEARS: bool>(
+         let mut cache = cache()
+             .lock()
+             .unwrap_or_else(|poisoned| poisoned.into_inner());
+-        let next_key = cache.len() as u64 + 1;
+         cache
+             .entry(key)
+             .or_insert_with(|| {
+@@ -314,7 +367,6 @@ pub(super) fn try_execute<const PREPARED_CLEARS: bool>(
+                     workspace,
+                     requires_stage_clear,
+                     current_clear_stages,
+-                    next_key,
+                 );
+                 if let Err(message) = &encoded {
+                     eprintln!("pacman: {RUNNER}: this plan run stays on the CPU: {message}");
+@@ -389,7 +441,6 @@ fn encode<const PREPARED_CLEARS: bool>(
+     workspace: &DirectWorkspace<'_>,
+     requires_stage_clear: bool,
+     current_clear_stages: Option<&[DirectStageClearRanges]>,
+-    key: u64,
+ ) -> Result<Encoded, String> {
+     let stride = workspace.point_stride as usize;
+     let current_planes = workspace.current_re.len() / stride;
+@@ -582,6 +633,7 @@ fn encode<const PREPARED_CLEARS: bool>(
+     if words.len() > u32::MAX as usize {
+         return Err("too many rows".into());
+     }
++    let key = words_key(&words, &width);
+     Ok(Encoded {
+         key,
+         words: words.into_boxed_slice(),
+-- 
+2.43.0
+

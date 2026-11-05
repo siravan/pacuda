@@ -12,5 +12,6 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 libloading = "0.9"
-# the patched RustiCol (local e2e-pacman branch), offline only: its record mode (feature pacman)
-rusticol-core = { path = "../../mg7-e2e/pyamplicol/rust/crates/rusticol-core", features = ["pacman"] }
+# the patched RustiCol (rusticol/prepare.sh: pyAmpliCol at rusticol/UPSTREAM with rusticol/patches),
+# its record mode (feature pacman); used only to convert
+rusticol-core = { path = "../build/rusticol/pyamplicol/rust/crates/rusticol-core", features = ["pacman"] }

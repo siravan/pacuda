@@ -1,0 +1,497 @@
+From 517fffc6ac5da47a72a6279c915d34377536864d Mon Sep 17 00:00:00 2001
+From: Shahriar Iravanian <siravan@svtsim.com>
+Date: Tue, 27 Oct 2026 21:59:13 -0400
+Subject: [PATCH 01/12] rusticol: tile-override feature (RUSTICOL_TILE_POINTS)
+
+New cargo feature `tile-override` (off by default). With RUSTICOL_TILE_POINTS=N,
+compiled-direct engines whose cache-sized reduction tile is 1 point run with
+execution and reduction tiles of N points instead; other engines are unchanged.
+Large processes (e.g. u u~ > Z + 6g) spend much less time per point in the
+reduction with N in the thousands, and N is the batch a GPU runner sees.
+
+Also fixes rustfmt in evaluation.rs, helicity_lane.rs and reduction.rs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../rust/crates/rusticol-core/Cargo.toml      |   2 +
+ .../src/direct_arena/reduction.rs             |  20 +++
+ .../rust/crates/rusticol-core/src/engine.rs   |   5 +
+ .../src/engine/compiled_direct_prototype.rs   |  76 ++++++---
+ .../rusticol-core/src/engine/evaluation.rs    | 153 ++++++++++++++----
+ .../rusticol-core/src/engine/helicity_lane.rs |  42 +++--
+ .../rusticol-core/src/engine/tile_override.rs |  29 ++++
+ 7 files changed, 257 insertions(+), 70 deletions(-)
+ create mode 100644 pyamplicol/rust/crates/rusticol-core/src/engine/tile_override.rs
+
+diff --git a/pyamplicol/rust/crates/rusticol-core/Cargo.toml b/pyamplicol/rust/crates/rusticol-core/Cargo.toml
+index 55a301563d..4305d83352 100644
+--- a/pyamplicol/rust/crates/rusticol-core/Cargo.toml
++++ b/pyamplicol/rust/crates/rusticol-core/Cargo.toml
+@@ -20,6 +20,8 @@ python-generation-bridge = ["f64-symjit"]
+ # feature is deliberately absent from production/default builds.
+ on-the-fly-test-support = ["f64-symjit"]
+ symbolica-runtime = ["dep:symbolica"]
++# Tiles of RUSTICOL_TILE_POINTS points (see src/engine/tile_override.rs).
++tile-override = []
+ 
+ [dependencies]
+ bincode.workspace = true
+diff --git a/pyamplicol/rust/crates/rusticol-core/src/direct_arena/reduction.rs b/pyamplicol/rust/crates/rusticol-core/src/direct_arena/reduction.rs
+index 8c382f7a7f..eefeccfd3d 100644
+--- a/pyamplicol/rust/crates/rusticol-core/src/direct_arena/reduction.rs
++++ b/pyamplicol/rust/crates/rusticol-core/src/direct_arena/reduction.rs
+@@ -82,6 +82,26 @@ impl<'a> DirectAmplitudePlanes<'a> {
+         self.shape.component_count()
+     }
+ 
++    /// Active points `start..start + count` as an active tile of `count`
++    /// points (one replay mapping of a tile that holds several).
++    pub(crate) fn rows(self, start: usize, count: usize) -> RusticolResult<Self> {
++        if count == 0
++            || start
++                .checked_add(count)
++                .is_none_or(|stop| stop > self.point_count as usize)
++        {
++            return Err(invalid(
++                "direct amplitude row range exceeds the active tile",
++            ));
++        }
++        Ok(Self {
++            values_re: &self.values_re[start..],
++            values_im: &self.values_im[start..],
++            shape: self.shape,
++            point_count: count as u32,
++        })
++    }
++
+     /// Return one active plane without exposing its physical pitch padding.
+     ///
+     /// Callers validate the component catalog once before entering their hot
+diff --git a/pyamplicol/rust/crates/rusticol-core/src/engine.rs b/pyamplicol/rust/crates/rusticol-core/src/engine.rs
+index 23e35c6a03..26dd018184 100644
+--- a/pyamplicol/rust/crates/rusticol-core/src/engine.rs
++++ b/pyamplicol/rust/crates/rusticol-core/src/engine.rs
+@@ -4717,6 +4717,11 @@ use evaluation::resolved_f64_totals;
+ #[cfg(any(feature = "f64-compiled", feature = "f64-symjit"))]
+ mod compiled_direct_prototype;
+ mod helicity_lane;
++#[cfg(all(
++    feature = "tile-override",
++    any(feature = "f64-compiled", feature = "f64-symjit")
++))]
++mod tile_override;
+ use helicity_lane::*;
+ mod momentum;
+ use momentum::*;
+diff --git a/pyamplicol/rust/crates/rusticol-core/src/engine/compiled_direct_prototype.rs b/pyamplicol/rust/crates/rusticol-core/src/engine/compiled_direct_prototype.rs
+index b532dabfbc..7c2366fb98 100644
+--- a/pyamplicol/rust/crates/rusticol-core/src/engine/compiled_direct_prototype.rs
++++ b/pyamplicol/rust/crates/rusticol-core/src/engine/compiled_direct_prototype.rs
+@@ -65,6 +65,21 @@ fn compiled_direct_cache_target_bytes() -> usize {
+     COMPILED_DIRECT_CACHE_TARGET_BYTES
+ }
+ 
++/// `RUSTICOL_TILE_POINTS=N` (feature `tile-override`) for a tile that the
++/// cache target sizes to `points`: N where that leaves a single point (a
++/// footprint above the cache target), `None` elsewhere.
++fn compiled_direct_tile_override(points: u32) -> RusticolResult<Option<u32>> {
++    #[cfg(feature = "tile-override")]
++    if let Some(tile) = super::tile_override::tile_override()? {
++        let collapsed = points == 1;
++        if collapsed {
++            return Ok(Some(tile));
++        }
++    }
++    let _ = points;
++    Ok(None)
++}
++
+ #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+ pub(crate) struct CompiledDirectPrototypeTraffic {
+     /// Direct source-wavefunction writes into canonical current planes.
+@@ -293,14 +308,22 @@ impl CompiledDirectTileSizing {
+         let capacity = u32::try_from(self.effective_tile_capacity).map_err(|_| {
+             RusticolError::integrity("compiled Direct-Arena tile capacity exceeds u32")
+         })?;
+-        Ok(deterministic_point_tile_size_with_cache_footprint(
+-            capacity,
+-            usize::MAX,
+-            compiled_direct_cache_target_bytes(),
+-            self.physical_scalar_values_per_point,
+-            self.execution_scalar_values_per_point
+-                .max(reduction_scalars),
+-        )? as usize)
++        let tile = |cache_target_bytes| {
++            deterministic_point_tile_size_with_cache_footprint(
++                capacity,
++                usize::MAX,
++                cache_target_bytes,
++                self.physical_scalar_values_per_point,
++                self.execution_scalar_values_per_point
++                    .max(reduction_scalars),
++            )
++        };
++        let points = tile(compiled_direct_cache_target_bytes())?;
++        if compiled_direct_tile_override(points)?.is_some() {
++            // the whole execution tile, which the override sized
++            return Ok(tile(usize::MAX)? as usize);
++        }
++        Ok(points as usize)
+     }
+ }
+ 
+@@ -409,21 +432,32 @@ fn compiled_direct_tile_sizing(
+                 )? as usize;
+                 (capacity, capacity)
+             } else {
+-                let execution_capacity = deterministic_point_tile_size_with_cache_footprint(
+-                    COMPILED_DIRECT_LOCALITY_POINT_CAP,
+-                    usize::MAX,
+-                    compiled_direct_cache_target_bytes(),
+-                    physical_scalar_values_per_point,
+-                    execution_scalar_values_per_point,
+-                )? as usize;
+-                let reduction_capacity = deterministic_point_tile_size_with_cache_footprint(
++                let tiles = |point_cap, cache_target_bytes| -> RusticolResult<(usize, usize)> {
++                    let execution_capacity = deterministic_point_tile_size_with_cache_footprint(
++                        point_cap,
++                        usize::MAX,
++                        cache_target_bytes,
++                        physical_scalar_values_per_point,
++                        execution_scalar_values_per_point,
++                    )? as usize;
++                    let reduction_capacity = deterministic_point_tile_size_with_cache_footprint(
++                        point_cap,
++                        usize::MAX,
++                        cache_target_bytes,
++                        physical_scalar_values_per_point,
++                        hot_scalar_values_per_point,
++                    )? as usize;
++                    Ok((execution_capacity, reduction_capacity))
++                };
++                let (execution_capacity, reduction_capacity) = tiles(
+                     COMPILED_DIRECT_LOCALITY_POINT_CAP,
+-                    usize::MAX,
+                     compiled_direct_cache_target_bytes(),
+-                    physical_scalar_values_per_point,
+-                    hot_scalar_values_per_point,
+-                )? as usize;
+-                (execution_capacity, reduction_capacity)
++                )?;
++                // the reduction tile is the smaller: its footprint includes the execution's
++                match compiled_direct_tile_override(reduction_capacity as u32)? {
++                    Some(points) => tiles(points, usize::MAX)?,
++                    None => (execution_capacity, reduction_capacity),
++                }
+             }
+         }
+     };
+diff --git a/pyamplicol/rust/crates/rusticol-core/src/engine/evaluation.rs b/pyamplicol/rust/crates/rusticol-core/src/engine/evaluation.rs
+index 7bb044cdc1..6e2adcd618 100644
+--- a/pyamplicol/rust/crates/rusticol-core/src/engine/evaluation.rs
++++ b/pyamplicol/rust/crates/rusticol-core/src/engine/evaluation.rs
+@@ -43,6 +43,59 @@ fn evaluate_direct_color_schedule(
+     direct.evaluate_all(point_count)
+ }
+ 
++/// Rows of a batch of `mappings` replay mappings × `points` points (a
++/// routed evaluation of several mappings at once) must hold every point of
++/// every mapping.
++#[cfg(any(feature = "f64-compiled", feature = "f64-symjit"))]
++pub(super) fn check_replay_rows(rows: usize, mappings: usize, points: usize) -> RusticolResult<()> {
++    if mappings == 0 || mappings.checked_mul(points) != Some(rows) {
++        return Err(RusticolError::integrity(
++            "routed topology replay batch does not hold its mappings' points",
++        ));
++    }
++    Ok(())
++}
++
++/// The parts of batch rows `start..stop` (mapping-major, `points` rows per
++/// mapping), one per mapping: (mapping, first row from `start`, rows, first
++/// point of the mapping).
++#[cfg(any(feature = "f64-compiled", feature = "f64-symjit"))]
++pub(super) fn replay_segments(
++    start: usize,
++    stop: usize,
++    points: usize,
++) -> impl Iterator<Item = (usize, usize, usize, usize)> {
++    let mut row = start;
++    std::iter::from_fn(move || {
++        if row >= stop {
++            return None;
++        }
++        let mapping = row / points;
++        let segment_stop = ((mapping + 1) * points).min(stop);
++        let segment = (
++            mapping,
++            row - start,
++            segment_stop - row,
++            row - mapping * points,
++        );
++        row = segment_stop;
++        Some(segment)
++    })
++}
++
++/// Replay mappings per routed evaluation: with feature `tile-override` and
++/// `RUSTICOL_TILE_POINTS=N`, as many as fill N rows of `points` points each,
++/// so that one engine call covers several mappings; otherwise one.
++#[cfg(any(feature = "f64-compiled", feature = "f64-symjit"))]
++fn routed_replay_mappings_per_call(points: usize) -> RusticolResult<usize> {
++    #[cfg(feature = "tile-override")]
++    if let Some(tile) = super::tile_override::tile_override()? {
++        return Ok((tile as usize / points.max(1)).max(1));
++    }
++    let _ = points;
++    Ok(1)
++}
++
+ impl ExecutionRuntime {
+     fn has_compiled_symmetric_group_diagnostic(&self) -> bool {
+         self.amplitude_stage.as_ref().is_some_and(|amplitude| {
+@@ -875,35 +928,61 @@ impl ExecutionRuntime {
+         let mut target_components = std::mem::take(&mut self.lc_replay_target_components_scratch);
+         target_components.resize(target_scalar_count, 0.0);
+         target_components.fill(0.0);
++        let mappings_per_call = routed_replay_mappings_per_call(batch.point_count())?;
++        // several mappings' permuted momenta, one after the other
++        let mut expanded_momenta = Vec::new();
+         let result = (|| {
+             for source_group in &selection.source_groups {
+                 let materialized_sector_ids = source_group
+                     .materialized_sector_ids
+                     .as_ref()
+                     .expect("topology-replay source cache preflighted");
+-                for (mapping_index, replay_entry) in source_group
+-                    .mapping_indices
+-                    .iter()
+-                    .copied()
+-                    .zip(&source_group.entries)
++                for chunk_start in
++                    (0..source_group.mapping_indices.len()).step_by(mappings_per_call)
+                 {
+-                    let mapping = mappings.get(mapping_index).ok_or_else(|| {
+-                        RusticolError::integrity(
+-                            "LC topology replay selection references an unknown mapping",
+-                        )
+-                    })?;
+-                    let evaluation_view = if mapping.is_empty() {
+-                        batch
++                    let chunk_end =
++                        (chunk_start + mappings_per_call).min(source_group.mapping_indices.len());
++                    let replay_entry = &source_group.entries[chunk_start..chunk_end];
++                    let chunk = &source_group.mapping_indices[chunk_start..chunk_end];
++                    let mut chunk_mappings = chunk.iter().map(|&mapping_index| {
++                        mappings.get(mapping_index).ok_or_else(|| {
++                            RusticolError::integrity(
++                                "LC topology replay selection references an unknown mapping",
++                            )
++                        })
++                    });
++                    let evaluation_view = if chunk.len() == 1 {
++                        let mapping = chunk_mappings.next().expect("one mapping")?;
++                        if mapping.is_empty() {
++                            batch
++                        } else {
++                            apply_lc_topology_label_permutation_from_view_into_flat(
++                                batch,
++                                self.external_count,
++                                mapping,
++                                &mut flat_momenta,
++                            )?;
++                            F64MomentumBatchView::from_contiguous_prevalidated(
++                                &flat_momenta,
++                                batch.point_count(),
++                                self.external_count,
++                                None,
++                            )?
++                        }
+                     } else {
+-                        apply_lc_topology_label_permutation_from_view_into_flat(
+-                            batch,
+-                            self.external_count,
+-                            mapping,
+-                            &mut flat_momenta,
+-                        )?;
++                        expanded_momenta.clear();
++                        for mapping in chunk_mappings {
++                            apply_lc_topology_label_permutation_from_view_into_flat(
++                                batch,
++                                self.external_count,
++                                mapping?,
++                                &mut flat_momenta,
++                            )?;
++                            expanded_momenta.extend_from_slice(&flat_momenta);
++                        }
+                         F64MomentumBatchView::from_contiguous_prevalidated(
+-                            &flat_momenta,
+-                            batch.point_count(),
++                            &expanded_momenta,
++                            chunk.len() * batch.point_count(),
+                             self.external_count,
+                             None,
+                         )?
+@@ -1339,13 +1418,14 @@ impl ExecutionRuntime {
+         selected_helicity_ids: Option<&BTreeSet<String>>,
+         selected_color_ids: Option<&BTreeSet<String>>,
+         selected_color_sector_ids: Option<&BTreeSet<i64>>,
+-        replay_entry: &LcResolvedReplayEntry,
++        replay_entries: &[LcResolvedReplayEntry],
+         source_component_count: usize,
+         target_component_count: usize,
+         target_point_count: usize,
+         target_components: &mut [f64],
+     ) -> RusticolResult<()> {
+         let point_count = batch.point_count();
++        check_replay_rows(point_count, replay_entries.len(), target_point_count)?;
+         let physics = self.physics.clone().ok_or_else(|| {
+             RusticolError::invalid_argument(
+                 "schema-v3 artifact is missing resolved physics metadata; regenerate it with pyAmpliCol 0.1.0 or newer",
+@@ -1390,19 +1470,24 @@ impl ExecutionRuntime {
+                 selected_color_sector_ids,
+                 point_stop - point_start,
+             )?;
+-            amplitude.reduce_planes_f64_routed_components_add_into(
+-                direct.amplitude_planes()?,
+-                &physics,
+-                *normalization_factor,
+-                selected_helicity_ids,
+-                selected_color_ids,
+-                replay_entry,
+-                source_component_count,
+-                target_component_count,
+-                target_point_count,
+-                point_start,
+-                target_components,
+-            )?;
++            let planes = direct.amplitude_planes()?;
++            for (mapping, row, rows, target_point_start) in
++                replay_segments(point_start, point_stop, target_point_count)
++            {
++                amplitude.reduce_planes_f64_routed_components_add_into(
++                    planes.rows(row, rows)?,
++                    &physics,
++                    *normalization_factor,
++                    selected_helicity_ids,
++                    selected_color_ids,
++                    &replay_entries[mapping],
++                    source_component_count,
++                    target_component_count,
++                    target_point_count,
++                    target_point_start,
++                    target_components,
++                )?;
++            }
+             point_start = point_stop;
+         }
+         Ok(())
+diff --git a/pyamplicol/rust/crates/rusticol-core/src/engine/helicity_lane.rs b/pyamplicol/rust/crates/rusticol-core/src/engine/helicity_lane.rs
+index 9cd87b04d8..b674208b26 100644
+--- a/pyamplicol/rust/crates/rusticol-core/src/engine/helicity_lane.rs
++++ b/pyamplicol/rust/crates/rusticol-core/src/engine/helicity_lane.rs
+@@ -1,5 +1,7 @@
+ // SPDX-License-Identifier: 0BSD
+ 
++#[cfg(any(feature = "f64-compiled", feature = "f64-symjit"))]
++use super::evaluation::{check_replay_rows, replay_segments};
+ use super::sources::RuntimeSourceState;
+ use super::*;
+ 
+@@ -935,12 +937,17 @@ impl ExecutionRuntime {
+         selected_helicity_ids: &BTreeSet<String>,
+         selected_color_ids: Option<&BTreeSet<String>>,
+         selected_materialized_sector_ids: &BTreeSet<i64>,
+-        replay_entry: &LcResolvedReplayEntry,
++        replay_entries: &[LcResolvedReplayEntry],
+         source_component_count: usize,
+         target_component_count: usize,
+         target_point_count: usize,
+         target_components: &mut [f64],
+     ) -> RusticolResult<()> {
++        check_replay_rows(
++            batch.point_count(),
++            replay_entries.len(),
++            target_point_count,
++        )?;
+         if selected_helicity_ids.len() != 1 {
+             return Err(RusticolError::integrity(
+                 "routed materialized-helicity execution requires one source helicity",
+@@ -1035,20 +1042,25 @@ impl ExecutionRuntime {
+                 false,
+                 point_stop - point_start,
+             )?;
+-            amplitude.reduce_planes_f64_for_materialized_helicity_routed_components_add_into(
+-                direct.amplitude_planes()?,
+-                physics,
+-                *normalization_factor,
+-                schedule.physical_helicity_index,
+-                &schedule.root_factors,
+-                selected_color_ids,
+-                replay_entry,
+-                source_component_count,
+-                target_component_count,
+-                target_point_count,
+-                point_start,
+-                target_components,
+-            )?;
++            let planes = direct.amplitude_planes()?;
++            for (mapping, row, rows, target_point_start) in
++                replay_segments(point_start, point_stop, target_point_count)
++            {
++                amplitude.reduce_planes_f64_for_materialized_helicity_routed_components_add_into(
++                    planes.rows(row, rows)?,
++                    physics,
++                    *normalization_factor,
++                    schedule.physical_helicity_index,
++                    &schedule.root_factors,
++                    selected_color_ids,
++                    &replay_entries[mapping],
++                    source_component_count,
++                    target_component_count,
++                    target_point_count,
++                    target_point_start,
++                    target_components,
++                )?;
++            }
+             point_start = point_stop;
+         }
+         Ok(())
+diff --git a/pyamplicol/rust/crates/rusticol-core/src/engine/tile_override.rs b/pyamplicol/rust/crates/rusticol-core/src/engine/tile_override.rs
+new file mode 100644
+index 0000000000..6c04000302
+--- /dev/null
++++ b/pyamplicol/rust/crates/rusticol-core/src/engine/tile_override.rs
+@@ -0,0 +1,29 @@
++// SPDX-License-Identifier: 0BSD
++
++//! Larger tiles (cargo feature `tile-override`).
++//!
++//! RustiCol sizes a compiled engine's tiles to fit a cache target, at most
++//! 32 points. An engine whose reduction footprint per point exceeds the target
++//! gets tiles of a single point, and as many engine calls as points.
++//! `RUSTICOL_TILE_POINTS=N` (read when an artifact is loaded) gives such an
++//! engine tiles of N points instead, for its leaves and its reduction alike;
++//! other engines keep their cache-sized tiles. It also lets the LC replay
++//! evaluate several colour mappings per engine call (N / points).
++
++use crate::{RusticolError, RusticolResult};
++
++const TILE_POINTS: &str = "RUSTICOL_TILE_POINTS";
++
++/// The points per tile of `RUSTICOL_TILE_POINTS` (`None` if unset or empty).
++pub(crate) fn tile_override() -> RusticolResult<Option<u32>> {
++    let Some(value) = std::env::var_os(TILE_POINTS).filter(|value| !value.is_empty()) else {
++        return Ok(None);
++    };
++    match value.to_str().and_then(|value| value.parse::<u32>().ok()) {
++        Some(points) if points > 0 => Ok(Some(points)),
++        _ => Err(RusticolError::invalid_argument(format!(
++            "{TILE_POINTS}={}: expected a positive number of points",
++            value.to_string_lossy()
++        ))),
++    }
++}
+-- 
+2.43.0
+

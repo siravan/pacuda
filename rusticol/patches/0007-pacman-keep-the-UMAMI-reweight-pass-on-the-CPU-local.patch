@@ -1,0 +1,57 @@
+From c6741bdcad2fec4b8c3c6372fb78dc2da3fbfcb6 Mon Sep 17 00:00:00 2001
+From: Shahriar Iravanian <siravan@svtsim.com>
+Date: Tue, 3 Nov 2026 23:12:12 -0500
+Subject: [PATCH 07/12] pacman: keep the UMAMI reweight pass on the CPU (local,
+ e2e)
+
+rusticol-core (feature pacman) exports rusticol_pacman_recurrence_cpu_only(), which keeps
+the plan runs of the calling copy of RustiCol on the CPU. The reweight UMAMI wrapper calls
+it (weak reference) in umami_initialize: its calls are a few points at one helicity, which
+the GPU runner does far slower than the CPU. PYAMPLICOL_UMAMI_REWEIGHT_RUNNER=1 keeps the
+runner for that library too.
+---
+ .../src/recurrence/direct_backend_pacman.rs   | 20 ++++++++++++++++++-
+ 1 file changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/pyamplicol/rust/crates/rusticol-core/src/recurrence/direct_backend_pacman.rs b/pyamplicol/rust/crates/rusticol-core/src/recurrence/direct_backend_pacman.rs
+index ba45474bda..392b258c91 100644
+--- a/pyamplicol/rust/crates/rusticol-core/src/recurrence/direct_backend_pacman.rs
++++ b/pyamplicol/rust/crates/rusticol-core/src/recurrence/direct_backend_pacman.rs
+@@ -40,8 +40,23 @@ const TILE_POINTS: &str = "RUSTICOL_TILE_POINTS";
+ /// With `PACMAN_RECURRENCE_RUNNER` set, `RUSTICOL_TILE_POINTS=N` makes the recurrence tile N
+ /// points instead of the cache-sized one (at most the plan's tile, 64 for Z+6g): the GPU wants
+ /// many points per launch, and its arena is not the CPU's cache. Read when a plan is loaded.
++/// Set by `rusticol_pacman_recurrence_cpu_only`: this copy of RustiCol runs every plan on
++/// the CPU, whatever `PACMAN_RECURRENCE_RUNNER` says.
++static CPU_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++
++/// Keeps every recurrence plan run of *this copy* of RustiCol on the CPU. A program linking
++/// the static SDK has its own copy, so e.g. mg7's reweight (full-colour) UMAMI library can
++/// stay on the CPU while the LC library of the same process uses the GPU runner. Call it
++/// before the first evaluation; it does not unload a runner already in use.
++#[unsafe(no_mangle)]
++pub extern "C" fn rusticol_pacman_recurrence_cpu_only() {
++    CPU_ONLY.store(true, std::sync::atomic::Ordering::Relaxed);
++}
++
+ pub(super) fn gpu_tile_points() -> RusticolResult<Option<u32>> {
+-    if std::env::var_os(RUNNER).is_none_or(|v| v.is_empty()) {
++    if CPU_ONLY.load(std::sync::atomic::Ordering::Relaxed)
++        || std::env::var_os(RUNNER).is_none_or(|v| v.is_empty())
++    {
+         return Ok(None);
+     }
+     let Some(value) = std::env::var_os(TILE_POINTS).filter(|v| !v.is_empty()) else {
+@@ -211,6 +226,9 @@ struct Runner {
+ /// The library of `PACMAN_RECURRENCE_RUNNER` (`None` if unset); a library that
+ /// cannot be loaded is an error at the first plan run.
+ fn runner() -> Option<&'static Result<Runner, String>> {
++    if CPU_ONLY.load(std::sync::atomic::Ordering::Relaxed) {
++        return None;
++    }
+     static RUNNER_LIBRARY: OnceLock<Option<Result<Runner, String>>> = OnceLock::new();
+     RUNNER_LIBRARY
+         .get_or_init(|| {
+-- 
+2.43.0
+

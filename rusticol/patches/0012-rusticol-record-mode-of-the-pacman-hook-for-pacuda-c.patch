@@ -1,0 +1,472 @@
+From 5541d1b9fc4e73d6b08e5b5d290ebc5b63ee7fb3 Mon Sep 17 00:00:00 2001
+From: Shahriar Iravanian <siravan@svtsim.com>
+Date: Wed, 4 Nov 2026 20:10:05 -0500
+Subject: [PATCH 12/12] rusticol: record mode of the pacman hook, for pacuda
+ convert (local, e2e)
+
+recurrence::direct_backend::pacman_record(f) runs f with every plan run recorded as the runner
+would get it (program, scales, factors, run lists, momentum-form tables; sources, forms and
+symjit kernels on the device, symjit kernels by SHA-256) while the CPU runs the plan; the LC
+lane's resolved reduction adds each (amplitude plane, weight, helicity) to the run. No runner is
+needed. NativeRuntime::pacman_input_crossing gives the input crossing. execute shares the scale
+and amplitude-run code with the recording (call_scales, amplitude_runs).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/engine/native_runtime.rs              |  10 +
+ .../src/engine/recurrence_lane.rs             |   7 +
+ .../src/recurrence/direct_backend.rs          |  13 +
+ .../src/recurrence/direct_backend_pacman.rs   | 324 ++++++++++++++----
+ 4 files changed, 295 insertions(+), 59 deletions(-)
+
+diff --git a/pyamplicol/rust/crates/rusticol-core/src/engine/native_runtime.rs b/pyamplicol/rust/crates/rusticol-core/src/engine/native_runtime.rs
+index 40c931f570..f54600ad22 100644
+--- a/pyamplicol/rust/crates/rusticol-core/src/engine/native_runtime.rs
++++ b/pyamplicol/rust/crates/rusticol-core/src/engine/native_runtime.rs
+@@ -2260,6 +2260,16 @@ impl NativeRuntime {
+         self.physics_v1.get()
+     }
+ 
++    /// The input crossing (feature `pacman`, for `pacuda convert`): per runtime leg, the input
++    /// leg it is read from and the sign it is multiplied by (`F64MomentumBatchView`); `None`:
++    /// leg k is input leg k.
++    #[cfg(feature = "pacman")]
++    pub fn pacman_input_crossing(&self) -> Option<Vec<(usize, f64)>> {
++        self.input_crossing_map
++            .as_ref()
++            .map(|map| map.iter().map(|entry| (entry.source_index, entry.sign)).collect())
++    }
++
+     pub fn external_count(&self) -> usize {
+         self.runtime.external_count
+     }
+diff --git a/pyamplicol/rust/crates/rusticol-core/src/engine/recurrence_lane.rs b/pyamplicol/rust/crates/rusticol-core/src/engine/recurrence_lane.rs
+index 07d543bdd4..6469733fc9 100644
+--- a/pyamplicol/rust/crates/rusticol-core/src/engine/recurrence_lane.rs
++++ b/pyamplicol/rust/crates/rusticol-core/src/engine/recurrence_lane.rs
+@@ -1967,6 +1967,13 @@ impl RecurrenceNativeRuntime {
+                         let weight = reduction_view.helicity(*physical_helicity).coefficient
+                             * color_weight
+                             * common.normalization_factor;
++                        #[cfg(feature = "pacman")]
++                        crate::recurrence::direct_backend::pacman_record_reduction(
++                            amplitude.destination.id,
++                            weight,
++                            helicity_position as u32,
++                            color_position as u32,
++                        );
+                         accumulate_lc_diagonal_amplitude(
+                             point_count,
+                             weight,
+diff --git a/pyamplicol/rust/crates/rusticol-core/src/recurrence/direct_backend.rs b/pyamplicol/rust/crates/rusticol-core/src/recurrence/direct_backend.rs
+index 62508b37fa..5ed485831c 100644
+--- a/pyamplicol/rust/crates/rusticol-core/src/recurrence/direct_backend.rs
++++ b/pyamplicol/rust/crates/rusticol-core/src/recurrence/direct_backend.rs
+@@ -105,6 +105,19 @@ pub(crate) fn pacman_reduce(planes: &[u32], weights: &[f64], output: &mut [f64])
+     pacman::reduce(planes, weights, output)
+ }
+ 
++/// Recording plan runs for `pacuda convert` (feature `pacman`): `pacman_record(f)` runs `f` with
++/// every plan run and its LC reductions recorded (the CPU computes the values).
++#[cfg(feature = "pacman")]
++pub use pacman::{
++    RecordedReduction as PacmanRecordedReduction, RecordedRun as PacmanRecordedRun,
++    Recording as PacmanRecording, record as pacman_record,
++};
++
++#[cfg(feature = "pacman")]
++pub(crate) fn pacman_record_reduction(plane: u32, weight: f64, helicity: u32, color: u32) {
++    pacman::record_reduction(plane, weight, helicity, color);
++}
++
+ pub const DIRECT_STATUS_OK: c_int = 0;
+ 
+ thread_local! {
+diff --git a/pyamplicol/rust/crates/rusticol-core/src/recurrence/direct_backend_pacman.rs b/pyamplicol/rust/crates/rusticol-core/src/recurrence/direct_backend_pacman.rs
+index 51706ebcbd..7504ed00fa 100644
+--- a/pyamplicol/rust/crates/rusticol-core/src/recurrence/direct_backend_pacman.rs
++++ b/pyamplicol/rust/crates/rusticol-core/src/recurrence/direct_backend_pacman.rs
+@@ -109,6 +109,98 @@ thread_local! {
+     static KEPT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+ }
+ 
++// ---- recording (`pacuda convert`) --------------------------------------------------------------
++//
++// While a thread records (`record`), every plan run that would go to the runner is encoded as for
++// a runner with sources, forms and symjit kernels on the device; its call is copied into the
++// recording, and the CPU then runs the plan (no runner is needed). The LC lanes add their
++// reductions of the run's amplitudes (`record_reduction`), and the result of the evaluation is
++// the CPU's, so a recording carries its own reference values.
++
++/// One plan run as the runner gets it: the program, the tables and the run lists, and the
++/// reductions of its amplitudes the caller made.
++#[derive(Clone, Debug, Default)]
++pub struct RecordedRun {
++    pub words: Vec<u64>,
++    pub width: [u8; 8],
++    pub current_planes: u32,
++    pub amplitude_planes: u32,
++    pub momentum_planes: u32,
++    pub scale_re: Vec<f64>,
++    pub scale_im: Vec<f64>,
++    pub factor_re: Vec<f64>,
++    pub factor_im: Vec<f64>,
++    /// (first plane, count) runs
++    pub upload_amplitude: Vec<u32>,
++    pub zero_amplitude: Vec<u32>,
++    pub download_amplitude: Vec<u32>,
++    /// the tile (planes of `stride` values) and this run's points
++    pub stride: u32,
++    pub points: u32,
++    /// the momentum forms from the external momenta (`pacman_recurrence_call`)
++    pub external_count: u32,
++    pub form_terms: Vec<u32>,
++    pub term_slots: Vec<u32>,
++    pub term_coefficients: Vec<f64>,
++    pub reductions: Vec<RecordedReduction>,
++}
++
++/// `output[point, helicity, color] += weight * fma(re, re, im * im)` of amplitude plane `plane`,
++/// in recording order.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct RecordedReduction {
++    pub plane: u32,
++    pub weight: f64,
++    pub helicity: u32,
++    pub color: u32,
++}
++
++#[derive(Clone, Debug, Default)]
++pub struct Recording {
++    pub runs: Vec<RecordedRun>,
++    /// the symjit kernels, by SHA-256 of their plane applications: the kernel index of an op 14
++    /// word is a position here
++    pub symjit_sha256: Vec<String>,
++    /// why a plan run could not be recorded (the recording is then incomplete)
++    pub errors: Vec<String>,
++}
++
++thread_local! {
++    static RECORDING: std::cell::RefCell<Option<Recording>> = const { std::cell::RefCell::new(None) };
++}
++
++/// Runs `f` on this thread with the plan runs and their reductions recorded.
++pub fn record<R>(f: impl FnOnce() -> R) -> (R, Recording) {
++    RECORDING.with(|r| *r.borrow_mut() = Some(Recording::default()));
++    let result = f();
++    let recording = RECORDING.with(|r| r.borrow_mut().take()).unwrap_or_default();
++    (result, recording)
++}
++
++fn recording() -> bool {
++    RECORDING.with(|r| r.borrow().is_some())
++}
++
++fn record_error(message: String) {
++    RECORDING.with(|r| {
++        if let Some(recording) = r.borrow_mut().as_mut() {
++            recording.errors.push(message);
++        }
++    });
++}
++
++/// A reduction of the last recorded plan run's amplitude `plane` into output (helicity, color).
++pub(super) fn record_reduction(plane: u32, weight: f64, helicity: u32, color: u32) {
++    RECORDING.with(|r| {
++        if let Some(recording) = r.borrow_mut().as_mut() {
++            match recording.runs.last_mut() {
++                Some(run) => run.reductions.push(RecordedReduction { plane, weight, helicity, color }),
++                None => recording.errors.push("a reduction before any plan run".into()),
++            }
++        }
++    });
++}
++
+ /// The amplitude planes (`[start, end)` ranges) the runtime has just cleared
+ /// for the next plan run.
+ pub(super) fn note_cleared_amplitudes(ranges: &[std::ops::Range<usize>]) {
+@@ -263,7 +355,7 @@ thread_local! {
+ 
+ /// Whether the runner fills the momentum forms (and the sources) on the device.
+ pub(super) fn forms_on_device_available() -> bool {
+-    matches!(runner(), Some(Ok(runner)) if runner.forms)
++    recording() || matches!(runner(), Some(Ok(runner)) if runner.forms)
+ }
+ 
+ /// Defers this thread's next plan runs' momentum forms to the device. `external` must stay
+@@ -449,6 +541,20 @@ fn symjit_executor(
+     let Some(binding) = crate::engine::pacman_symjit::binding(call, context) else {
+         return Ok(None);
+     };
++    if recording() {
++        let index = RECORDING.with(|r| {
++            let mut r = r.borrow_mut();
++            let recording = r.as_mut().expect("recording");
++            match recording.symjit_sha256.iter().position(|s| *s == binding.sha256) {
++                Some(index) => index,
++                None => {
++                    recording.symjit_sha256.push(binding.sha256.clone());
++                    recording.symjit_sha256.len() - 1
++                }
++            }
++        });
++        return Ok(Some((index as u32, binding)));
++    }
+     let Some(Ok(runner)) = runner() else {
+         return Ok(None);
+     };
+@@ -543,6 +649,23 @@ pub(super) fn try_execute<const PREPARED_CLEARS: bool>(
+     requires_stage_clear: bool,
+     current_clear_stages: Option<&[DirectStageClearRanges]>,
+ ) -> Option<RusticolResult<()>> {
++    if recording() {
++        if let Err(message) = record_run::<PREPARED_CLEARS>(
++            plan,
++            row_groups,
++            selected_sector_id,
++            executors,
++            workspace,
++            point_count,
++            requires_stage_clear,
++            current_clear_stages,
++        ) {
++            record_error(message);
++        }
++        // the CPU runs the plan (from the forms on the host)
++        fill_deferred_forms_on_host(workspace);
++        return None;
++    }
+     let runner = match runner()? {
+         Ok(runner) => runner,
+         Err(message) => return Some(Err(RusticolError::evaluation(message.clone()))),
+@@ -1046,62 +1169,79 @@ fn encode<const PREPARED_CLEARS: bool>(
+     })
+ }
+ 
+-fn execute(
+-    runner: &Runner,
+-    encoded: &Encoded,
+-    device_forms: bool,
++/// The plan run's call as `execute` would make it, into the recording.
++#[allow(clippy::too_many_arguments)]
++fn record_run<const PREPARED_CLEARS: bool>(
+     plan: &DirectRecurrencePlan,
+     row_groups: &[DirectRowGroupDescriptor],
++    selected_sector_id: Option<u32>,
+     executors: &DirectExecutorCatalog,
+     workspace: &mut DirectWorkspace<'_>,
+     point_count: u32,
+-) -> RusticolResult<()> {
+-    workspace.validate(point_count)?;
+-    // the sources, on the CPU (`encode` checked that they come first), unless on the GPU
+-    for descriptor in row_groups
+-        .iter()
+-        .filter(|descriptor| descriptor.role == DirectExecutorRole::Source && !encoded.gpu_sources)
+-    {
+-        if descriptor.direct_executor_id == DIRECT_NONE_U32
+-            && plan.strategy() == RecurrenceStrategy::AllFlowUnion
+-        {
+-            continue;
+-        }
+-        let start = descriptor.row_start as usize;
+-        let rows = plan
+-            .sources()
+-            .get(start..start + descriptor.row_count as usize)
+-            .ok_or_else(|| {
+-                RusticolError::integrity("direct recurrence source row group is out of bounds")
+-            })?;
+-        let DirectExecutorHandle::Source { call, context } =
+-            executors.require(descriptor.direct_executor_id, DirectExecutorRole::Source)?
+-        else {
+-            return Err(RusticolError::integrity(
+-                "a source executor has another role",
+-            ));
+-        };
+-        let (arena, momenta, parameters, factors) = workspace.raw_views()?;
+-        let status = unsafe {
+-            call(
+-                context,
+-                arena,
+-                momenta,
+-                parameters,
+-                factors,
+-                rows.as_ptr(),
+-                descriptor.row_count,
+-                point_count,
+-            )
+-        };
+-        check_status(
+-            DirectExecutorRole::Source,
+-            descriptor.direct_executor_id,
+-            status,
+-        )?;
++    requires_stage_clear: bool,
++    current_clear_stages: Option<&[DirectStageClearRanges]>,
++) -> Result<(), String> {
++    let encoded = encode::<PREPARED_CLEARS>(
++        plan,
++        row_groups,
++        selected_sector_id,
++        executors,
++        workspace,
++        requires_stage_clear,
++        current_clear_stages,
++        true,
++    )?;
++    if !encoded.gpu_sources || !encoded.source_currents.is_empty() {
++        return Err("a source row has no GPU template".into());
+     }
++    workspace.validate(point_count).map_err(|e| e.to_string())?;
++    let (scale_re, scale_im) = call_scales(&encoded, executors, workspace).map_err(|e| e.to_string())?;
++    let (upload_amplitude, zero_amplitude) = amplitude_runs(&encoded);
++    let stride = workspace.point_stride as usize;
++    let mut run = RecordedRun {
++        words: encoded.words.to_vec(),
++        width: encoded.width,
++        current_planes: (workspace.current_re.len() / stride) as u32,
++        amplitude_planes: (workspace.amplitude_re.len() / stride) as u32,
++        momentum_planes: (workspace.momenta.len() / stride) as u32,
++        scale_re,
++        scale_im,
++        factor_re: workspace.factors_re.to_vec(),
++        factor_im: workspace.factors_im.to_vec(),
++        upload_amplitude,
++        zero_amplitude,
++        download_amplitude: encoded.amplitudes.to_vec(),
++        stride: workspace.point_stride,
++        points: point_count,
++        ..RecordedRun::default()
++    };
++    DEFERRED_FORMS.with(|deferred| -> Result<(), String> {
++        let deferred = deferred.borrow();
++        let forms = deferred.as_ref().ok_or("the plan run's momentum forms were not deferred")?;
++        if forms.points != point_count {
++            return Err("deferred momentum forms have another point count".into());
++        }
++        run.external_count = forms.sources;
++        run.form_terms = forms.form_terms.clone();
++        run.term_slots = forms.slots.clone();
++        run.term_coefficients = forms.coefficients.clone();
++        Ok(())
++    })?;
++    RECORDING.with(|r| {
++        if let Some(recording) = r.borrow_mut().as_mut() {
++            recording.runs.push(run);
++        }
++    });
++    Ok(())
++}
+ 
+-    // the scales of this call's parameters
++/// The scale slots of a call: the contribution scales, the source masses, the symjit scalars, from
++/// the workspace's current parameters.
++fn call_scales(
++    encoded: &Encoded,
++    executors: &DirectExecutorCatalog,
++    workspace: &mut DirectWorkspace<'_>,
++) -> RusticolResult<(Vec<f64>, Vec<f64>)> {
+     let (_, _, parameters, _) = workspace.raw_views()?;
+     let mut scale_re = Vec::with_capacity(encoded.slots.len());
+     let mut scale_im = Vec::with_capacity(encoded.slots.len());
+@@ -1155,16 +1295,11 @@ fn execute(
+         scale_re.push(value);
+         scale_im.push(0.0);
+     }
++    Ok((scale_re, scale_im))
++}
+ 
+-    let stride = workspace.point_stride as usize;
+-    let planes = |len: usize| -> RusticolResult<u32> {
+-        u32::try_from(len / stride)
+-            .map_err(|_| RusticolError::integrity("a recurrence arena exceeds u32 planes"))
+-    };
+-    let current_planes = planes(workspace.current_re.len())?;
+-    let whole_currents = [0, current_planes];
+-    let download_current: &[u32] = if runner.whole { &whole_currents } else { &[] };
+-    // amplitude runs inside the planes the runtime cleared are zeroed on the device
++/// The amplitude runs to upload and, inside the planes the runtime cleared, to zero on the device.
++fn amplitude_runs(encoded: &Encoded) -> (Vec<u32>, Vec<u32>) {
+     let (mut upload_amplitude, mut zero_amplitude) = (Vec::new(), Vec::new());
+     CLEARED_AMPLITUDES.with(|cleared| {
+         let cleared = cleared.borrow();
+@@ -1176,6 +1311,77 @@ fn execute(
+             if inside { &mut zero_amplitude } else { &mut upload_amplitude }.extend([first, count]);
+         }
+     });
++    (upload_amplitude, zero_amplitude)
++}
++
++fn execute(
++    runner: &Runner,
++    encoded: &Encoded,
++    device_forms: bool,
++    plan: &DirectRecurrencePlan,
++    row_groups: &[DirectRowGroupDescriptor],
++    executors: &DirectExecutorCatalog,
++    workspace: &mut DirectWorkspace<'_>,
++    point_count: u32,
++) -> RusticolResult<()> {
++    workspace.validate(point_count)?;
++    // the sources, on the CPU (`encode` checked that they come first), unless on the GPU
++    for descriptor in row_groups
++        .iter()
++        .filter(|descriptor| descriptor.role == DirectExecutorRole::Source && !encoded.gpu_sources)
++    {
++        if descriptor.direct_executor_id == DIRECT_NONE_U32
++            && plan.strategy() == RecurrenceStrategy::AllFlowUnion
++        {
++            continue;
++        }
++        let start = descriptor.row_start as usize;
++        let rows = plan
++            .sources()
++            .get(start..start + descriptor.row_count as usize)
++            .ok_or_else(|| {
++                RusticolError::integrity("direct recurrence source row group is out of bounds")
++            })?;
++        let DirectExecutorHandle::Source { call, context } =
++            executors.require(descriptor.direct_executor_id, DirectExecutorRole::Source)?
++        else {
++            return Err(RusticolError::integrity(
++                "a source executor has another role",
++            ));
++        };
++        let (arena, momenta, parameters, factors) = workspace.raw_views()?;
++        let status = unsafe {
++            call(
++                context,
++                arena,
++                momenta,
++                parameters,
++                factors,
++                rows.as_ptr(),
++                descriptor.row_count,
++                point_count,
++            )
++        };
++        check_status(
++            DirectExecutorRole::Source,
++            descriptor.direct_executor_id,
++            status,
++        )?;
++    }
++
++    // the scales of this call's parameters
++    let (scale_re, scale_im) = call_scales(encoded, executors, workspace)?;
++
++    let stride = workspace.point_stride as usize;
++    let planes = |len: usize| -> RusticolResult<u32> {
++        u32::try_from(len / stride)
++            .map_err(|_| RusticolError::integrity("a recurrence arena exceeds u32 planes"))
++    };
++    let current_planes = planes(workspace.current_re.len())?;
++    let whole_currents = [0, current_planes];
++    let download_current: &[u32] = if runner.whole { &whole_currents } else { &[] };
++    // amplitude runs inside the planes the runtime cleared are zeroed on the device
++    let (upload_amplitude, zero_amplitude) = amplitude_runs(encoded);
+     let keep = KEEP_REQUESTED.get() && runner.reduce.is_some();
+     let call = RunnerCall {
+         abi_version: ABI_VERSION,
+-- 
+2.43.0
+

@@ -1,0 +1,342 @@
+From e0ea1648babf62aeca2b71d5c54c8df4ec808125 Mon Sep 17 00:00:00 2001
+From: Shahriar Iravanian <siravan@svtsim.com>
+Date: Wed, 4 Nov 2026 13:16:37 -0500
+Subject: [PATCH 08/12] rusticol: pacman recurrence runner evaluates the source
+ rows (local, e2e)
+
+When the runner library reports the capability (pacman_recurrence_v1_capabilities bit 0)
+and every source row is of the plain source executor with a supported family, the rows are
+encoded as op 12 words (template code from pacman_source_template, masses as extra scale
+slots) and their currents are no longer filled on the CPU and uploaded.
+PACMAN_RECURRENCE_GPU_SOURCES=0 keeps them on the CPU.
+---
+ .../rust/crates/rusticol-core/src/engine.rs   |   2 +
+ .../src/evaluator/recurrence_source_direct.rs |  44 +++++++
+ .../src/recurrence/direct_backend_pacman.rs   | 115 ++++++++++++++++--
+ 3 files changed, 153 insertions(+), 8 deletions(-)
+
+diff --git a/pyamplicol/rust/crates/rusticol-core/src/engine.rs b/pyamplicol/rust/crates/rusticol-core/src/engine.rs
+index c844b7b1b6..b3c831198d 100644
+--- a/pyamplicol/rust/crates/rusticol-core/src/engine.rs
++++ b/pyamplicol/rust/crates/rusticol-core/src/engine.rs
+@@ -4853,6 +4853,8 @@ pub(crate) use evaluator::recurrence_intrinsic_direct::execute_interaction_termi
+ pub(crate) use evaluator::recurrence_intrinsic_direct::{
+     pacman_contribution_op, pacman_contribution_scale, pacman_finalization_op,
+ };
++#[cfg(feature = "pacman")]
++pub(crate) use evaluator::recurrence_source_direct::pacman_source_template;
+ #[cfg(all(test, feature = "f64-symjit"))]
+ pub(crate) use evaluator::symjit_direct::tests::count_allocations;
+ #[cfg(any(feature = "f64-compiled", feature = "f64-symjit"))]
+diff --git a/pyamplicol/rust/crates/rusticol-core/src/evaluator/recurrence_source_direct.rs b/pyamplicol/rust/crates/rusticol-core/src/evaluator/recurrence_source_direct.rs
+index 2c8fc31155..bad810a5aa 100644
+--- a/pyamplicol/rust/crates/rusticol-core/src/evaluator/recurrence_source_direct.rs
++++ b/pyamplicol/rust/crates/rusticol-core/src/evaluator/recurrence_source_direct.rs
+@@ -628,6 +628,50 @@ impl OnTheFlyBoundUnionSourceProgram for LoadedBoundUnionSourceProgram {
+     }
+ }
+ 
++/// The pacman recurrence runner's template code of a source row (`direct_backend_pacman.rs`,
++/// op 12): family (0 scalar, 1 Weyl, 2 Dirac, 3 vector) | orientation << 3 (particle 0,
++/// antiparticle 1) | (helicity + 2) << 5 | (chirality + 1) << 8, and its mass parameter.
++/// `None` when the runner does not evaluate it: another source executor (bound, union,
++/// cold-bound), a spin-2 or self-conjugate fermion source, an unknown domain.
++#[cfg(feature = "pacman")]
++pub(crate) fn pacman_source_template(
++    call: DirectSourceExecutor,
++    context: *const c_void,
++    row: &DirectSourceRow,
++) -> Option<(u32, Option<u32>)> {
++    let plain: DirectSourceExecutor = execute_direct_source_rows;
++    if call as usize != plain as usize || context.is_null() {
++        return None;
++    }
++    // SAFETY: `execute_direct_source_rows` is only paired with this context type
++    let context = unsafe { &*context.cast::<DirectSourceExecutorContext>() };
++    let template = context
++        .domains
++        .get(row.source_template_or_dispatch_domain as usize)?
++        .resolve(DirectSourceDispatchKey::SpinStateClass(row.spin_state_class))?;
++    let family = match template.family {
++        DirectSourceWavefunctionFamily::Scalar => 0,
++        DirectSourceWavefunctionFamily::WeylFermion => 1,
++        DirectSourceWavefunctionFamily::DiracFermion => 2,
++        DirectSourceWavefunctionFamily::Vector => 3,
++        DirectSourceWavefunctionFamily::Spin2 => return None,
++    };
++    let orientation = match template.orientation {
++        DirectSourceOrientation::Particle => 0,
++        DirectSourceOrientation::Antiparticle => 1,
++        DirectSourceOrientation::SelfConjugate if family == 0 || family == 3 => 0,
++        DirectSourceOrientation::SelfConjugate => return None,
++    };
++    if !(-2..=2).contains(&template.helicity) || !(-1..=1).contains(&template.chirality) {
++        return None;
++    }
++    let code = family
++        | orientation << 3
++        | ((template.helicity + 2) as u32) << 5
++        | ((template.chirality + 1) as u32) << 8;
++    Some((code, template.mass_parameter_index))
++}
++
+ unsafe extern "C" fn execute_direct_source_rows(
+     context: *const c_void,
+     arena: DirectArenaView,
+diff --git a/pyamplicol/rust/crates/rusticol-core/src/recurrence/direct_backend_pacman.rs b/pyamplicol/rust/crates/rusticol-core/src/recurrence/direct_backend_pacman.rs
+index 392b258c91..c8ff41140d 100644
+--- a/pyamplicol/rust/crates/rusticol-core/src/recurrence/direct_backend_pacman.rs
++++ b/pyamplicol/rust/crates/rusticol-core/src/recurrence/direct_backend_pacman.rs
+@@ -7,7 +7,10 @@
+ //! kernel, which gets the plan's rows as 64-bit words (their layout is in
+ //! `recurrence_runner.cu`) and runs them all in one launch, one thread per point.
+ //!
+-//! - Source rows still run here, on the CPU; their currents (stage 0) are
++//! - Source rows run on the GPU when the library can (`pacman_recurrence_v1_capabilities`
++//!   bit 0, op 12: RustiCol's wavefunctions transcribed) and every source row is of the plain
++//!   source executor with a supported family; `PACMAN_RECURRENCE_GPU_SOURCES=0` keeps them
++//!   here. Otherwise they still run here, on the CPU; their currents (stage 0) are
+ //!   copied to the device, with the momentum forms, scales and factors.
+ //! - The current arena stays on the device. Only the amplitude planes that the
+ //!   closures add to go there and come back; `PACMAN_RECURRENCE_WHOLE=1` also
+@@ -74,6 +77,11 @@ const WHOLE: &str = "PACMAN_RECURRENCE_WHOLE";
+ const DUMP: &str = "PACMAN_RECURRENCE_DUMP";
+ const ABI_VERSION: u32 = 1;
+ const RUN_SYMBOL: &[u8] = b"pacman_recurrence_v1_run\0";
++const CAPABILITIES_SYMBOL: &[u8] = b"pacman_recurrence_v1_capabilities\0";
++const CAP_SOURCES: u32 = 1;
++const OP_SOURCE: u64 = 12;
++const SOURCE_TEMPLATE_BITS: u8 = 10;
++const GPU_SOURCES: &str = "PACMAN_RECURRENCE_GPU_SOURCES";
+ const REDUCE_SYMBOL: &[u8] = b"pacman_recurrence_v1_reduce\0";
+ const KEEP_AMPLITUDES: u32 = 1;
+ 
+@@ -219,6 +227,8 @@ type RunFunction = unsafe extern "C" fn(*const RunnerCall) -> i32;
+ struct Runner {
+     run: RunFunction,
+     reduce: Option<ReduceFunction>,
++    /// the library evaluates source rows (and `PACMAN_RECURRENCE_GPU_SOURCES` is not 0)
++    sources: bool,
+     whole: bool,
+     _library: libloading::Library,
+ }
+@@ -245,10 +255,17 @@ fn runner() -> Option<&'static Result<Runner, String>> {
+                 let reduce = unsafe { library.get::<ReduceFunction>(REDUCE_SYMBOL) }
+                     .ok()
+                     .map(|reduce| *reduce);
++                type CapabilitiesFunction = unsafe extern "C" fn() -> u32;
++                let capabilities = unsafe { library.get::<CapabilitiesFunction>(CAPABILITIES_SYMBOL) }
++                    .ok()
++                    .map_or(0, |capabilities| unsafe { (*capabilities)() });
++                let sources = capabilities & CAP_SOURCES != 0
++                    && std::env::var_os(GPU_SOURCES).is_none_or(|value| value != "0");
+                 eprintln!("pacman: {RUNNER}: {}", path.to_string_lossy());
+                 Ok(Runner {
+                     run,
+                     reduce,
++                    sources,
+                     whole: std::env::var_os(WHOLE).is_some_and(|value| value != "0"),
+                     _library: library,
+                 })
+@@ -266,8 +283,13 @@ struct Encoded {
+     width: [u8; 8],
+     /// per slot, the contribution executor whose scale it holds
+     slots: Box<[u32]>,
+-    /// (first plane, count) runs
++    /// (first plane, count) runs; empty when the sources run on the GPU
+     source_currents: Box<[u32]>,
++    /// the sources run on the GPU (op 12 words lead the program)
++    gpu_sources: bool,
++    /// the mass of each source mass slot (after the contribution slots): a model parameter
++    /// index, or none (massless)
++    masses: Box<[Option<u32>]>,
+     amplitudes: Box<[u32]>,
+ }
+ 
+@@ -287,6 +309,7 @@ struct Key {
+     clear_stages: Option<Box<[u64]>>,
+     requires_stage_clear: bool,
+     prepared_clears: bool,
++    gpu_sources: bool,
+ }
+ 
+ /// The runner caches a program per `words_key`. Every UMAMI library links its own
+@@ -369,6 +392,7 @@ pub(super) fn try_execute<const PREPARED_CLEARS: bool>(
+         clear_stages: current_clear_stages.map(clear_stage_words),
+         requires_stage_clear,
+         prepared_clears: PREPARED_CLEARS,
++        gpu_sources: runner.sources,
+     };
+     let encoded = {
+         let mut cache = cache()
+@@ -385,6 +409,7 @@ pub(super) fn try_execute<const PREPARED_CLEARS: bool>(
+                     workspace,
+                     requires_stage_clear,
+                     current_clear_stages,
++                    runner.sources,
+                 );
+                 if let Err(message) = &encoded {
+                     eprintln!("pacman: {RUNNER}: this plan run stays on the CPU: {message}");
+@@ -459,6 +484,7 @@ fn encode<const PREPARED_CLEARS: bool>(
+     workspace: &DirectWorkspace<'_>,
+     requires_stage_clear: bool,
+     current_clear_stages: Option<&[DirectStageClearRanges]>,
++    gpu_sources: bool,
+ ) -> Result<Encoded, String> {
+     let stride = workspace.point_stride as usize;
+     let current_planes = workspace.current_re.len() / stride;
+@@ -467,6 +493,9 @@ fn encode<const PREPARED_CLEARS: bool>(
+     let mut slots: Vec<u32> = Vec::new();
+     let mut ops = Vec::with_capacity(row_groups.len());
+     let mut seen_rows = false;
++    // (destination, form, factor, mass parameter, template code) of each source row
++    let mut source_rows: Vec<(u32, u32, u32, Option<u32>, u32)> = Vec::new();
++    let mut sources_on_gpu = gpu_sources;
+     for descriptor in row_groups {
+         let id = descriptor.direct_executor_id;
+         if descriptor.role == DirectExecutorRole::Source {
+@@ -474,6 +503,38 @@ fn encode<const PREPARED_CLEARS: bool>(
+                 return Err("a source row group follows other rows".into());
+             }
+             ops.push(0);
++            // the rows on the GPU, if all of them can be (else every source stays on the CPU)
++            if sources_on_gpu {
++                let template_rows = match executors.require(id, DirectExecutorRole::Source) {
++                    Ok(DirectExecutorHandle::Source { call, context }) if id != DIRECT_NONE_U32 => {
++                        let start = descriptor.row_start as usize;
++                        plan.sources()
++                            .get(start..start + descriptor.row_count as usize)
++                            .map(|rows| (call, context, rows))
++                    }
++                    _ => None,
++                };
++                match template_rows {
++                    Some((call, context, rows)) => {
++                        for row in rows {
++                            match crate::engine::pacman_source_template(call, context, row) {
++                                Some((code, mass)) => source_rows.push((
++                                    row.destination_component_base,
++                                    row.momentum_form_id,
++                                    row.exact_factor_id,
++                                    mass,
++                                    code,
++                                )),
++                                None => {
++                                    sources_on_gpu = false;
++                                    break;
++                                }
++                            }
++                        }
++                    }
++                    None => sources_on_gpu = false,
++                }
++            }
+             continue;
+         }
+         seen_rows = true;
+@@ -505,17 +566,37 @@ fn encode<const PREPARED_CLEARS: bool>(
+             op.ok_or_else(|| format!("executor {id} ({:?}) has no GPU kernel", descriptor.role))?,
+         );
+     }
++    if !sources_on_gpu {
++        source_rows.clear();
++    }
++    // the source masses: scale slots after the contributions' (a massless slot for none)
++    let mut masses: Vec<Option<u32>> = Vec::new();
++    for row in &source_rows {
++        if !masses.contains(&row.3) {
++            masses.push(row.3);
++        }
++    }
+     let mut width = [0u8; 8];
+     width[W_P] = bits(current_planes);
+     width[W_A] = bits(amplitude_planes.saturating_sub(1));
+     width[W_F] = bits((workspace.momentum_form_count as usize).saturating_sub(1));
+     width[W_X] = bits(workspace.factors_re.len().saturating_sub(1));
+-    width[W_S] = bits(slots.len().saturating_sub(1));
++    width[W_S] = bits((slots.len() + masses.len()).saturating_sub(1));
+     width[W_K] = COUNT_BITS;
+     let none_as_zero = |value: u32| if value == DIRECT_NONE_U32 { 0 } else { value };
+ 
+     let mut words = Vec::new();
+     let mut amplitudes = Vec::new();
++    for &(destination, form, factor, mass, code) in &source_rows {
++        let slot = slots.len() + masses.iter().position(|&m| m == mass).expect("listed above");
++        let word = Word::new(OP_SOURCE)
++            .put(destination.into(), width[W_P])?
++            .put(form.into(), width[W_F])?
++            .put(factor.into(), width[W_X])?
++            .put(slot as u64, width[W_S])?
++            .put(code.into(), SOURCE_TEMPLATE_BITS)?;
++        words.push(word.value);
++    }
+     let clear = |words: &mut Vec<u64>, base: u32, count: u32| -> Result<(), String> {
+         if count > 0 {
+             let word = Word::new(OP_CLEAR_CURRENTS)
+@@ -639,15 +720,15 @@ fn encode<const PREPARED_CLEARS: bool>(
+             DirectExecutorRole::Source => unreachable!("skipped above"),
+         }
+     }
+-    // the planes the sources write: the stage-0 currents
+-    let source_currents = runs(
++    // the planes the sources write: the stage-0 currents (uploaded only when the CPU fills them)
++    let source_currents = if sources_on_gpu { Box::default() } else { runs(
+         plan.currents()
+             .iter()
+             .filter(|current| current.stage == 0)
+             .flat_map(|current| {
+                 current.component_base..current.component_base + u32::from(current.component_count)
+             }),
+-    );
++    ) };
+     if words.len() > u32::MAX as usize {
+         return Err("too many rows".into());
+     }
+@@ -658,6 +739,8 @@ fn encode<const PREPARED_CLEARS: bool>(
+         width,
+         slots: slots.into_boxed_slice(),
+         source_currents,
++        gpu_sources: sources_on_gpu,
++        masses: masses.into_boxed_slice(),
+         amplitudes: runs(amplitudes),
+     })
+ }
+@@ -672,10 +755,10 @@ fn execute(
+     point_count: u32,
+ ) -> RusticolResult<()> {
+     workspace.validate(point_count)?;
+-    // the sources, on the CPU (`encode` checked that they come first)
++    // the sources, on the CPU (`encode` checked that they come first), unless on the GPU
+     for descriptor in row_groups
+         .iter()
+-        .filter(|descriptor| descriptor.role == DirectExecutorRole::Source)
++        .filter(|descriptor| descriptor.role == DirectExecutorRole::Source && !encoded.gpu_sources)
+     {
+         if descriptor.direct_executor_id == DIRECT_NONE_U32
+             && plan.strategy() == RecurrenceStrategy::AllFlowUnion
+@@ -737,6 +820,22 @@ fn execute(
+         scale_re.push(re);
+         scale_im.push(im);
+     }
++    for &mass in encoded.masses.iter() {
++        let value = match mass {
++            None => 0.0,
++            Some(index) => {
++                if index >= parameters.value_count || parameters.values_re.is_null() {
++                    return Err(RusticolError::evaluation(format!(
++                        "direct recurrence source mass parameter {index} is out of bounds"
++                    )));
++                }
++                // SAFETY: index < value_count of the live parameter view
++                unsafe { *parameters.values_re.add(index as usize) }
++            }
++        };
++        scale_re.push(value);
++        scale_im.push(0.0);
++    }
+ 
+     let stride = workspace.point_stride as usize;
+     let planes = |len: usize| -> RusticolResult<u32> {
+-- 
+2.43.0
+
