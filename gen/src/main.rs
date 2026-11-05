@@ -1,8 +1,13 @@
 // SPDX-License-Identifier: 0BSD
 //! pacuda-gen: CUDA device functions from pyAmpliCol's symjit plane kernels.
 //!
-//!   pacuda-gen cuda FILE.plane.symjit... [-o OUT.cuh]
-//!   pacuda-gen check FILE.plane.symjit... -d DIR [-n POINTS]
+//!   pacuda-gen cuda FILE.plane.symjit... [-o OUT.cuh] [--avx227]
+//!   pacuda-gen check FILE.plane.symjit... -d DIR [-n POINTS] [--avx227]
+//!
+//! `--avx227`: the operation order of symjit 2.27.3's AVX kernels (`cuda::Order::Avx227`).
+//! `--avx227-lanes L` (cuda): also that order's variants, for the points in whole blocks of L of
+//! each runner call, as RustiCol pinned to symjit 2.27.3 runs them (L = 4 on AVX); the others
+//! keep the scalar order. Bit-identity with such a RustiCol; symjit >= 2.28 needs neither.
 //!
 //! `cuda` writes one function per kernel, named `pk_<NNNNNN>` after the kernel directory
 //! (`kernels/NNNNNN/application-1.plane.symjit`). `check` also writes, in DIR, `kernels.cuh`,
@@ -32,18 +37,69 @@ fn kernel_name(path: &Path) -> String {
     }
 }
 
-fn generate(paths: &[PathBuf]) -> Result<(String, Vec<cuda::CudaFunction>)> {
+/// The functions of `paths` (distinct kernels: a file whose bytes repeat an earlier one's is
+/// skipped) and the runner's interface to them: `pacuda_kernel(k, in, out)`,
+/// `pacuda_kernel_sha256[k]`, PACUDA_KERNEL_COUNT, PACUDA_MAX_IN, PACUDA_MAX_OUT.
+/// With `simd_lanes` > 0, each kernel also gets its symjit 2.27.3 AVX-order variant
+/// (`<name>_avx227`), and `pacuda_kernel(k, simd, in, out)` takes it where `simd` is set (the
+/// runner sets it for the points in whole blocks of `PACUDA_SIMD_LANES`, as RustiCol runs its
+/// SIMD kernel); `order` is the order of the plain functions.
+fn generate_with(paths: &[PathBuf], order: cuda::Order, simd_lanes: usize) -> Result<(String, Vec<cuda::CudaFunction>)> {
+    use sha2::{Digest, Sha256};
     let mut source = String::from(cuda::PRELUDE);
     let mut functions = Vec::new();
+    let mut digests: Vec<String> = Vec::new();
     for path in paths {
         let bytes = std::fs::read(path).map_err(|e| anyhow!("{}: {}", path.display(), e))?;
+        let digest: String = Sha256::digest(&bytes).iter().map(|b| format!("{:02x}", b)).collect();
+        if digests.contains(&digest) {
+            continue;
+        }
         let mut model = sjb::SavedModel::read(&bytes).map_err(|e| anyhow!("{}: {:#}", path.display(), e))?;
-        let f = model.cuda(&kernel_name(path))?;
+        let f = model.cuda_with(&kernel_name(path), order)?;
         source.push('\n');
         source.push_str(&f.source);
+        if simd_lanes > 0 {
+            let mut model = sjb::SavedModel::read(&bytes).map_err(|e| anyhow!("{}: {:#}", path.display(), e))?;
+            let v = model.cuda_with(&format!("{}_avx227", kernel_name(path)), cuda::Order::Avx227)?;
+            source.push('\n');
+            source.push_str(&v.source);
+        }
         functions.push(f);
+        digests.push(digest);
+    }
+    let max_in = functions.iter().map(|f| f.shape.count_in).max().unwrap_or(0).max(1);
+    let max_out = functions.iter().map(|f| f.shape.count_out).max().unwrap_or(0).max(2);
+    let _ = writeln!(source, "\n#define PACUDA_KERNEL_COUNT {}", functions.len());
+    let _ = writeln!(source, "#define PACUDA_MAX_IN {}\n#define PACUDA_MAX_OUT {}", max_in, max_out);
+    let _ = writeln!(source, "#define PACUDA_SIMD_LANES {}", simd_lanes);
+    let _ = writeln!(source, "static const char *const pacuda_kernel_sha256[{}] = {{", functions.len().max(1));
+    for (f, d) in functions.iter().zip(&digests) {
+        let _ = writeln!(source, "\t\"{}\", // {}", d, f.name);
+    }
+    let _ = writeln!(source, "}};");
+    // one dispatch per order (a single one holding both orders was miscompiled: nvcc 13.4,
+    // sm_120, an invalid `in` pointer in the runner)
+    let suffixes: &[&str] = if simd_lanes > 0 { &["", "_avx227"] } else { &[""] };
+    for suffix in suffixes {
+        let _ = writeln!(source, "static __device__ __noinline__ void pacuda_kernel{}(uint32_t k, const double *in, double *out) {{", suffix);
+        let _ = writeln!(source, "\tswitch (k) {{");
+        for (k, f) in functions.iter().enumerate() {
+            let _ = writeln!(source, "\tcase {}: {}{}(in, out); break;", k, f.name, suffix);
+        }
+        let _ = writeln!(source, "\t}}\n}}");
+    }
+    let _ = writeln!(source, "static __device__ __forceinline__ void pacuda_kernel(uint32_t k, bool simd, const double *in, double *out) {{");
+    if simd_lanes > 0 {
+        let _ = writeln!(source, "\tif (simd) pacuda_kernel_avx227(k, in, out);\n\telse pacuda_kernel(k, in, out);\n}}");
+    } else {
+        let _ = writeln!(source, "\t(void)simd;\n\tpacuda_kernel(k, in, out);\n}}");
     }
     Ok((source, functions))
+}
+
+fn generate(paths: &[PathBuf], order: cuda::Order) -> Result<(String, Vec<cuda::CudaFunction>)> {
+    generate_with(paths, order, 0)
 }
 
 /// symjit's CPU kernels of a plane application, loaded as RustiCol loads them (the saved
@@ -87,9 +143,20 @@ fn cpu_kernel(bytes: &[u8]) -> Result<CpuKernel> {
     Ok(CpuKernel { params: applet.params.clone(), _applet: applet, scalar, simd })
 }
 
-fn check(paths: &[PathBuf], dir: &Path, points: usize) -> Result<()> {
+fn check(paths: &[PathBuf], dir: &Path, points: usize, order: cuda::Order) -> Result<()> {
     std::fs::create_dir_all(dir)?;
-    let (source, functions) = generate(paths)?;
+    // one file per distinct kernel, as `generate` keeps them
+    let mut seen: Vec<Vec<u8>> = Vec::new();
+    let mut unique: Vec<PathBuf> = Vec::new();
+    for path in paths {
+        let bytes = std::fs::read(path)?;
+        if !seen.contains(&bytes) {
+            seen.push(bytes);
+            unique.push(path.clone());
+        }
+    }
+    let paths = &unique[..];
+    let (source, functions) = generate(paths, order)?;
     std::fs::write(dir.join("kernels.cuh"), &source)?;
     let mut bin: Vec<u8> = Vec::new();
     let put = |bin: &mut Vec<u8>, v: &[f64]| v.iter().for_each(|x| bin.extend_from_slice(&x.to_le_bytes()));
@@ -158,7 +225,7 @@ fn check(paths: &[PathBuf], dir: &Path, points: usize) -> Result<()> {
 
     let mut cu = String::new();
     let _ = writeln!(cu, "// Generated by pacuda-gen check: the device functions against symjit's CPU kernels.");
-    let _ = writeln!(cu, "#include <cstdio>\n#include <cstdlib>\n#include <cstring>\n#include <cstdint>\n#include <vector>");
+    let _ = writeln!(cu, "#include <cstdio>\n#include <cstdlib>\n#include <cstring>\n#include <cstdint>\n#include <cmath>\n#include <vector>");
     let _ = writeln!(cu, "#include \"kernels.cuh\"");
     let _ = writeln!(cu, "__global__ void run(int k, int n_in, int n_out, int n, const double *in, double *out) {{");
     let _ = writeln!(cu, "\tint i = blockIdx.x * blockDim.x + threadIdx.x;\n\tif (i >= n) return;");
@@ -223,25 +290,31 @@ fn main() {
     let result = (|| -> Result<()> {
         let command = args.first().ok_or_else(|| anyhow!("usage: pacuda-gen cuda|check FILE... [-o OUT | -d DIR] [-n POINTS]"))?;
         let (mut files, mut out, mut dir, mut points) = (Vec::new(), None, None, 4096usize);
+        let mut order = cuda::Order::Scalar;
+        let mut simd_lanes = 0usize;
         let mut it = args[1..].iter();
         while let Some(a) = it.next() {
             match a.as_str() {
                 "-o" => out = it.next().cloned(),
                 "-d" => dir = it.next().cloned(),
                 "-n" => points = it.next().ok_or_else(|| anyhow!("-n needs a value"))?.parse()?,
+                "--avx227" => order = cuda::Order::Avx227,
+                "--avx227-lanes" => {
+                    simd_lanes = it.next().ok_or_else(|| anyhow!("--avx227-lanes needs a value"))?.parse()?
+                }
                 _ => files.push(PathBuf::from(a)),
             }
         }
         match command.as_str() {
             "cuda" => {
-                let (source, _) = generate(&files)?;
+                let (source, _) = generate_with(&files, order, simd_lanes)?;
                 match out {
                     Some(o) => std::fs::write(o, source)?,
                     None => print!("{}", source),
                 }
                 Ok(())
             }
-            "check" => check(&files, Path::new(&dir.ok_or_else(|| anyhow!("check needs -d DIR"))?), points),
+            "check" => check(&files, Path::new(&dir.ok_or_else(|| anyhow!("check needs -d DIR"))?), points, order),
             other => bail!("unknown command `{}`", other),
         }
     })();

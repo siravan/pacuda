@@ -1,0 +1,10 @@
+[package]
+name = "symjit227"
+version = "0.1.0"
+edition = "2021"
+license = "0BSD"
+description = "symjit 2.27.3's (RustiCol's) CPU outputs of plane kernels on the inputs of a pacuda-gen check.bin"
+
+[dependencies]
+anyhow = "1"
+symjit = { version = "=2.27.3", default-features = false }

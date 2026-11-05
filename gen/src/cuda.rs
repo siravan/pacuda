@@ -46,8 +46,19 @@ static __device__ __forceinline__ unsigned long long pk_ubits(double x) { return
 static __device__ __forceinline__ double pk_mask(bool c) { return pk_bits(c ? ~0ull : 0ull); }
 ";
 
+/// Which CPU kernel's operation order a function follows: symjit's scalar kernel (and its SIMD
+/// kernels from 2.28 on), or the AVX kernel of symjit 2.27.3, whose complex products take other
+/// branches when a destination is also a factor (`amd/vector.rs` `times_complex` of 2.27.3,
+/// replaced in 2.28 with the scalar order by the aliasing fix, symjit #30). RustiCol pinned to
+/// 2.27.3 runs whole lane blocks with that kernel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Order {
+    Scalar,
+    Avx227,
+}
+
 impl SavedModel {
-    pub fn cuda(&mut self, name: &str) -> Result<CudaFunction> {
+    pub fn cuda_with(&mut self, name: &str, order: Order) -> Result<CudaFunction> {
         if self.prog.config().symbolica() && !self.prog.config().direct_arena() {
             return Err(anyhow!("{}: not a direct-arena plane kernel", name));
         }
@@ -59,6 +70,7 @@ impl SavedModel {
             return Err(anyhow!("{}: a kernel with shared parameters", name));
         }
         let mut generator = CudaGenerator::new(name, shape);
+        generator.order = order;
         let (s, o, p) = (self.prog.count_states, self.prog.count_obs, self.prog.count_params);
         self.prog.builder.compile_from_mir(&self.mir, &mut generator, s, o, p)?;
         generator.check()?;
@@ -140,6 +152,7 @@ struct CudaGenerator {
     count_states: u32,
     unsupported: Vec<String>,
     function: String,
+    order: Order,
 }
 
 /// The scratch variables (`x0`..`x3`).
@@ -159,6 +172,7 @@ impl CudaGenerator {
             count_states: 0,
             unsupported: Vec::new(),
             function: String::new(),
+            order: Order::Scalar,
         }
     }
 
@@ -589,6 +603,42 @@ impl Generator for CudaGenerator {
     }
     // x86's scalar generator: x1 x2 - y1 y2 and x2 y1 + x1 y2, each with one fused operation
     fn times_complex(&mut self, xd: Reg, yd: Reg, x1: Reg, y1: Reg, x2: Reg, y2: Reg) -> bool {
+        if self.order == Order::Avx227 {
+            // symjit 2.27.3's AVX sequence, its branches on the logical registers and its
+            // operations on the physical ones (`reg` maps Ret/Left and Temp/Right to one variable)
+            let (lxd, lx1, lx2) = (xd, x1, x2);
+            let (xd, yd) = (self.reg(xd), self.reg(yd));
+            let (x1, y1, x2, y2) = (self.reg(x1), self.reg(y1), self.reg(x2), self.reg(y2));
+            let (xt, yt) = (self.reg(Reg::Gen(2)), self.reg(Reg::Gen(3)));
+            let fms = Op::Fma { neg_product: false, neg_add: true };
+            let fma = Op::Fma { neg_product: false, neg_add: false };
+            if lxd != lx1 && lxd != lx2 {
+                self.op(&xd, Op::Mul, &[&y1, &y2]);
+                self.op(&xd, fms, &[&x1, &x2, &xd]);
+                self.op(&yd, Op::Mul, &[&x1, &y2]);
+                self.op(&yd, fma, &[&x2, &y1, &yd]);
+            } else if lxd == lx1 && lxd != lx2 {
+                self.op(&xt, Op::Mul, &[&y1, &y2]);
+                self.op(&xt, fms, &[&x1, &x2, &xt]);
+                self.op(&yd, Op::Mul, &[&x2, &y1]);
+                self.op(&yd, fma, &[&x1, &y2, &yd]);
+                self.op(&xd, Op::Mov, &[&xt]);
+            } else if lxd != lx1 && lxd == lx2 {
+                self.op(&xt, Op::Mul, &[&y1, &y2]);
+                self.op(&xt, fms, &[&x1, &x2, &xt]);
+                self.op(&yd, Op::Mul, &[&x1, &y2]);
+                self.op(&yd, fma, &[&x2, &y1, &yd]);
+                self.op(&xd, Op::Mov, &[&xt]);
+            } else {
+                self.op(&xt, Op::Mul, &[&y1, &y2]);
+                self.op(&xt, fms, &[&x1, &x2, &xt]);
+                self.op(&yt, Op::Mul, &[&x1, &y2]);
+                self.op(&yt, fma, &[&x2, &y1, &yt]);
+                self.op(&xd, Op::Mov, &[&xt]);
+                self.op(&yd, Op::Mov, &[&yt]);
+            }
+            return true;
+        }
         let (xd, yd) = (self.reg(xd), self.reg(yd));
         let (x1, y1, x2, y2) = (self.reg(x1), self.reg(y1), self.reg(x2), self.reg(y2));
         let fma = |neg_add| Op::Fma { neg_product: false, neg_add };

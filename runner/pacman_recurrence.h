@@ -78,7 +78,11 @@ int pacman_recurrence_v1_reduce(const pacman_recurrence_reduce *reduce);
 // bit 0: op 12 (sources on the device); bit 1: PACMAN_RECURRENCE_FORMS_ON_DEVICE
 #define PACMAN_RECURRENCE_CAP_SOURCES 1u
 #define PACMAN_RECURRENCE_CAP_FORMS 2u
+// bit 2: op 13/14 (symjit rows), with generated kernels (`pacman_recurrence_v1_symjit_kernel`)
+#define PACMAN_RECURRENCE_CAP_SYMJIT 4u
 uint32_t pacman_recurrence_v1_capabilities(void);
+// the index of the generated symjit kernel of this SHA-256 (hex), or -1
+int pacman_recurrence_v1_symjit_kernel(const char *sha256_hex);
 
 #ifdef __cplusplus
 }

@@ -1,22 +1,24 @@
 #!/bin/sh
 # Phase 0: record the runner calls of the LC libraries of the outputs in phase0/outputs under
 # varied inputs (momenta, batch size, alpha_s, helicity mode), plus a CPU reference run of each.
-# usage: phase0/run.sh [OUTPUT...]   (default: every output); results in phase0/results/
+# usage: [RUNNER=librecurrence.so] [KERNEL=f64] phase0/run.sh [OUTPUT...]
+#   (default: every output, the plain runner build/librecurrence.so); results in phase0/results/
 set -e
 here=$(cd "$(dirname "$0")" && pwd)
 root=$here/..
 res=$here/results
 mkdir -p "$res"
 [ -f "$root/build/librecurrence.so" ] || "$root/runner/build.sh" "$root/build"
+real=${RUNNER:-$root/build/librecurrence.so}
 cc -O2 -shared -fPIC -o "$root/build/librecord.so" "$here/record.c" -ldl -lpthread
 outputs=${*:-$(ls "$here/outputs")}
-export PACMAN_RECURRENCE_KERNEL=f64
+export PACMAN_RECURRENCE_KERNEL=${KERNEL:-f64}
 for o in $outputs; do
     dir=$here/outputs/$o
-    rm -f "$res/$o"-*
+    rm -f "$res/$o"-* "$res/$o.log"
     # name seed points alpha_s mode
     while read -r name seed k a mode; do
-        PACUDA_TRACE=$res/$o-$name.jsonl PACUDA_REAL_RUNNER=$root/build/librecurrence.so \
+        PACUDA_TRACE=$res/$o-$name.jsonl PACUDA_REAL_RUNNER=$real \
         PACMAN_RECURRENCE_RUNNER=$root/build/librecord.so \
             python3 "$here/drive.py" "$dir" "$res/$o-$name.npz" "$seed" "$k" "$a" "$mode" 2>>"$res/$o.log"
     done <<EOF

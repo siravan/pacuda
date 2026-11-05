@@ -24,6 +24,7 @@ static unsigned long seq;
 static int (*real_run)(const pacman_recurrence_call *);
 static int (*real_reduce)(const pacman_recurrence_reduce *);
 static uint32_t (*real_capabilities)(void);
+static int (*real_symjit_kernel)(const char *);
 
 static void init(void) {
     if (real_run) return;
@@ -36,6 +37,7 @@ static void init(void) {
     real_run = dlsym(lib, "pacman_recurrence_v1_run");
     real_reduce = dlsym(lib, "pacman_recurrence_v1_reduce");
     real_capabilities = dlsym(lib, "pacman_recurrence_v1_capabilities");
+    real_symjit_kernel = dlsym(lib, "pacman_recurrence_v1_symjit_kernel");  /* optional */
     const char *trace = getenv("PACUDA_TRACE");
     out = fopen(trace ? trace : "pacuda-trace.jsonl", "a");
     if (!out || !real_run || !real_reduce || !real_capabilities) abort();
@@ -75,6 +77,13 @@ uint32_t pacman_recurrence_v1_capabilities(void) {
     init();
     pthread_mutex_unlock(&lock);
     return real_capabilities();
+}
+
+int pacman_recurrence_v1_symjit_kernel(const char *sha256_hex) {
+    pthread_mutex_lock(&lock);
+    init();
+    pthread_mutex_unlock(&lock);
+    return real_symjit_kernel ? real_symjit_kernel(sha256_hex) : -1;
 }
 
 int pacman_recurrence_v1_run(const pacman_recurrence_call *c) {

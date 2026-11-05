@@ -27,6 +27,14 @@
 //                                 orientation (2: particle, antiparticle), helicity + 2 (3),
 //                                 chirality + 1 (2)
 //
+//   op 13 symjit row              1 initialize, P parent0, P parent1, P destination, F form0,
+//                                 F form1, X exact factor: a contribution or finalization of a
+//                                 symjit-compiled executor, by the binding of the last op 14
+//   op 14 symjit binding          16-bit kernel index, 8-bit input count n, 8-bit output pair count
+//                                 m, 1-bit direct-capable; then ceil((n + m) / 2) data words of two
+//                                 32-bit codes each (low half first): the n input codes, then the m
+//                                 destination components of the output pairs (see `symjit_row`)
+//
 // Sources (op 12, before all other rows) evaluate RustiCol's external wavefunctions
 // (`wavefunctions.rs`, transcribed) in f64 from the f64 momentum forms, in their own kernel before
 // the df64/f32 conversions, so they equal the CPU's sources bit for bit in every kernel's layout.
@@ -49,6 +57,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 #include <algorithm>
 #include <unordered_map>
@@ -158,6 +167,7 @@ struct Arena {
     const double *mom;
     const double *sre, *sim, *fre, *fim;
     size_t ld;
+    const uint32_t *bind;  // the symjit bindings of the program (op 14)
 };
 
 template <class R>
@@ -541,6 +551,36 @@ template <> __device__ __forceinline__ D narrow<D>(double x) {
     return D(hi, __double2float_rn(x - (double)hi));
 }
 
+// ---- symjit rows (op 13): pyAmpliCol's symjit-compiled executors -----------------------------
+//
+// The kernels are generated (`pacuda-gen cuda`) and included at build time with
+// -DPACUDA_KERNELS='"file.cuh"': f64 functions `pk_*(in, out)`, the dispatch
+// `pacuda_kernel(k, in, out)`, PACUDA_KERNEL_COUNT, PACUDA_MAX_IN, PACUDA_MAX_OUT and
+// `pacuda_kernel_sha256[k]` (the hex SHA-256 of kernel k's `.plane.symjit`). With
+// PACUDA_SIMD_LANES = L > 0 the points in whole blocks of L of a call take the kernels' symjit
+// 2.27.3 AVX-order variants, the rest the scalar order, as RustiCol pinned to symjit 2.27.3 runs
+// a tile (SIMD kernel per block of lanes from point 0, scalar kernel for the remainder). Without them the
+// runner has no symjit kernels (capability bit 2 clear) and refuses op 13.
+#ifdef PACUDA_KERNELS
+#include PACUDA_KERNELS
+#else
+#define PACUDA_KERNEL_COUNT 0
+#define PACUDA_MAX_IN 1
+#define PACUDA_MAX_OUT 2
+#define PACUDA_SIMD_LANES 0
+static const char *const pacuda_kernel_sha256[1] = {""};
+static __device__ void pacuda_kernel(uint32_t, bool, const double *, double *) {}
+#endif
+
+template <class T> __device__ __forceinline__ double to_f64(T x);
+template <> __device__ __forceinline__ double to_f64<double>(double x) { return x; }
+template <> __device__ __forceinline__ double to_f64<float>(float x) { return (double)x; }
+template <> __device__ __forceinline__ double to_f64<D>(D x) { return __dadd_rn((double)x.hi, (double)x.lo); }
+
+// binding input codes: bits 0-2 the kind, bit 3 the parent or momentum operand, bit 4 imaginary,
+// bits 5- the component (or the scale slot)
+enum { B_PARENT, B_MOMENTUM, B_DESTINATION, B_SCALE, B_FACTOR };
+
 // ---- programs: the words rewritten by the host (`prepare` below), 32 bytes per instruction ----
 //
 // w[0] = kind | op << 8 | flags << 16; the fields follow in w[1..7]. The program is the plan's
@@ -548,7 +588,7 @@ template <> __device__ __forceinline__ D narrow<D>(double x) {
 // of rows, so its sum is unchanged) and the destination of a run of rows on one destination kept
 // in registers (F_FIRST loads or starts it, F_LAST stores it).
 
-enum { K_CLEAR = 1, K_CONTRIB, K_PROP, K_IDENTITY, K_CLOSURE, K_SOURCE };
+enum { K_CLEAR = 1, K_CONTRIB, K_PROP, K_IDENTITY, K_CLOSURE, K_SOURCE, K_SYMJIT };
 enum { F_INIT = 1, F_FIRST = 2, F_LAST = 4 };
 
 struct IOp {
@@ -586,6 +626,61 @@ template <> __device__ __forceinline__ void st_cur<float>(const Arena &a, size_t
 template <class R>
 __device__ __forceinline__ Cx<R> ld_cr(const Arena &a, uint32_t plane, size_t i) {
     return ld_cur<R>(a, plane * a.ld + i);
+}
+
+// A row of a symjit executor, as RustiCol's `execute_rows` runs it: the kernel's inputs gathered
+// by its binding (`parameter_bindings`: arena planes and scalars), the kernel on them (in f64),
+// then each output pair scaled by the row's exact factor into the destination component:
+// `dest (+)= re fr - im fi, re fi + im fr` (`apply_complex_scaled`), or written as it is for a
+// direct-capable finalization whose factor is exactly 1 (`direct_outputs_are_structurally_safe`).
+// The values pass through f64 in every kernel (for the f64 kernel: RustiCol's arithmetic).
+template <class K>
+__device__ __noinline__ void symjit_row(const Arena &a, const IOp &o, int flags, size_t i, uint32_t points) {
+    typedef typename K::real R;
+    typedef typename K::den Den;
+    const uint32_t *b = a.bind + o.w[7];
+    uint32_t kernel = b[0], n_in = b[1], pairs = b[2], direct = b[3];
+    const uint32_t *code = b + 4, *comp = b + 4 + n_in;
+    uint32_t p[2] = {o.w[2], o.w[3]}, f[2] = {o.w[5] & 0xffff, o.w[5] >> 16}, dst = o.w[4];
+    double fr = to_f64(ldr<R>(a.fre, o.w[6])), fi = to_f64(ldr<R>(a.fim, o.w[6]));
+    double in[PACUDA_MAX_IN], out[PACUDA_MAX_OUT];
+    for (uint32_t k = 0; k < n_in; k++) {
+        uint32_t c = code[k], kind = c & 7, which = (c >> 3) & 1, im = (c >> 4) & 1, n = c >> 5;
+        double v = 0.0;
+        if (kind == B_PARENT || kind == B_DESTINATION) {
+            Cx<R> x = ld_cr<R>(a, (kind == B_PARENT ? p[which] : dst) + n, i);
+            v = to_f64(im ? x.im : x.re);
+        } else if (kind == B_MOMENTUM) {
+            v = to_f64(ldr<Den>(a.mom, (f[which] * 4 + n) * a.ld + i));
+        } else if (kind == B_SCALE) {
+            v = to_f64(ldr<R>(a.sre, n));
+        } else {
+            v = im ? fi : fr;
+        }
+        in[k] = v;
+    }
+    bool simd = PACUDA_SIMD_LANES > 0 && i < (size_t)(points / (PACUDA_SIMD_LANES > 0 ? PACUDA_SIMD_LANES : 1)) * PACUDA_SIMD_LANES;
+    pacuda_kernel(kernel, simd, in, out);
+    bool as_is = direct && __double_as_longlong(fr) == __double_as_longlong(1.0) &&
+                 __double_as_longlong(fi) == 0;
+    for (uint32_t j = 0; j < pairs; j++) {
+        double re = out[2 * j], im = out[2 * j + 1];
+        size_t at = (dst + comp[j]) * a.ld + i;
+        double sr, si;
+        if (as_is) {
+            sr = re;
+            si = im;
+        } else {
+            sr = __dsub_rn(__dmul_rn(re, fr), __dmul_rn(im, fi));
+            si = __dadd_rn(__dmul_rn(re, fi), __dmul_rn(im, fr));
+            if (!(flags & F_INIT)) {
+                Cx<R> d = ld_cur<R>(a, at);
+                sr = __dadd_rn(to_f64(d.re), sr);
+                si = __dadd_rn(to_f64(d.im), si);
+            }
+        }
+        st_cur<R>(a, at, cx(narrow<R>(sr), narrow<R>(si)));
+    }
 }
 
 template <class K, int OP>
@@ -710,6 +805,8 @@ __global__ void run_program(const IOp *__restrict__ ops, uint32_t count, Arena a
             case 5: contribution<K, 5>(a, o, flags, acc, i); break;
             default: contribution<K, 6>(a, o, flags, acc, i); break;
             }
+        } else if (kind == K_SYMJIT) {
+            symjit_row<K>(a, o, flags, i, points);
         } else if (kind == K_CLEAR) {
             for (uint32_t k = 0; k < o.w[2]; k++) st_cur<R>(a, (o.w[1] + k) * a.ld + i, cx(R(0.0), R(0.0)));
         } else if (kind == K_PROP) {
@@ -815,8 +912,9 @@ Device device;
 // ---- programs (host) ---------------------------------------------------------------------------
 
 struct Row {
-    int op;           // the word's op (1..11)
+    int op;           // the word's op (1..14)
     uint32_t f[8];    // its fields in word order
+    std::vector<uint32_t> data;  // op 14: the binding's codes
 };
 
 std::vector<Row> decode(const uint64_t *words, uint32_t count, const uint8_t *width) {
@@ -824,6 +922,22 @@ std::vector<Row> decode(const uint64_t *words, uint32_t count, const uint8_t *wi
     rows.reserve(count);
     for (uint32_t n = 0; n < count; n++) {
         uint64_t w = words[n];
+        if ((w & 15) == 14) {  // a symjit binding and its data words
+            Row r{};
+            r.op = 14;
+            r.f[0] = (uint32_t)(w >> 4) & 0xffff;   // kernel
+            r.f[1] = (uint32_t)(w >> 20) & 0xff;    // inputs
+            r.f[2] = (uint32_t)(w >> 28) & 0xff;    // output pairs
+            r.f[3] = (uint32_t)(w >> 36) & 1;       // direct-capable
+            uint32_t codes = r.f[1] + r.f[2];
+            for (uint32_t k = 0; k < codes; k++) {
+                uint64_t d = n + 1 + k / 2 < count ? words[n + 1 + k / 2] : 0;
+                r.data.push_back((uint32_t)(k % 2 ? d >> 32 : d));
+            }
+            n += (codes + 1) / 2;
+            rows.push_back(r);
+            continue;
+        }
         auto take = [&](int bits) {
             uint32_t v = (uint32_t)(w & ((1ull << bits) - 1));
             w >>= bits;
@@ -849,6 +963,10 @@ std::vector<Row> decode(const uint64_t *words, uint32_t count, const uint8_t *wi
             int f[5] = {P, F, X, S, 10};
             for (int k = 0; k < 5; k++) fields[k] = f[k];
             nf = 5;
+        } else if (r.op == 13) {
+            int f[7] = {1, P, P, P, F, F, X};
+            for (int k = 0; k < 7; k++) fields[k] = f[k];
+            nf = 7;
         }
         for (int k = 0; k < nf; k++) r.f[k] = take(fields[k]);
         rows.push_back(r);
@@ -894,10 +1012,29 @@ IOp make_op(int kind, int op, int flags) {
     return o;
 }
 
-std::vector<IOp> program(const std::vector<Row> &rows) {
+// `bindings`: the symjit bindings (op 14) as `symjit_row` reads them: kernel, inputs, output
+// pairs, direct-capable, the input codes, the destination components
+std::vector<IOp> program(const std::vector<Row> &rows, std::vector<uint32_t> &bindings) {
     std::vector<IOp> ops;
+    int64_t binding = -1;
     for (size_t n = 0; n < rows.size(); n++) {
         const Row &r = rows[n];
+        if (r.op == 14) {
+            binding = (int64_t)bindings.size();
+            bindings.insert(bindings.end(), {r.f[0], r.f[1], r.f[2], r.f[3]});
+            bindings.insert(bindings.end(), r.data.begin(), r.data.end());
+            continue;
+        }
+        if (r.op == 13) {
+            IOp o = make_op(K_SYMJIT, 13, r.f[0] ? F_INIT : 0);
+            o.w[1] = 0;
+            o.w[2] = r.f[1]; o.w[3] = r.f[2]; o.w[4] = r.f[3];
+            o.w[5] = r.f[4] | r.f[5] << 16;
+            o.w[6] = r.f[6];
+            o.w[7] = (uint32_t)binding;  // checked by `prepare`
+            ops.push_back(o);
+            continue;
+        }
         if (r.op >= 2 && r.op <= 6) {
             bool first = n == 0 || rows[n - 1].op < 2 || rows[n - 1].op > 6 || rows[n - 1].f[4] != r.f[4];
             bool last = n + 1 == rows.size() || rows[n + 1].op < 2 || rows[n + 1].op > 6 ||
@@ -921,6 +1058,7 @@ struct Prepared {
     uint32_t count;
     IOp *ops;
     uint32_t sources = 0;  // the leading K_SOURCE instructions (run by `run_sources`)
+    uint32_t *bindings = nullptr;  // the symjit bindings (op 14), on the device
 };
 
 bool failed(cudaError_t e, const char *step) {
@@ -1010,8 +1148,29 @@ const Prepared *prepare(const pacman_recurrence_call *call) {
     }
     std::vector<Row> rows = decode(call->words, call->word_count, call->width);
     if (sort_option()) sort_contribution_runs(rows);
-    std::vector<IOp> ops = program(rows);
+    for (const Row &r : rows)
+        if ((r.op == 13 || r.op == 14) && PACUDA_KERNEL_COUNT == 0) {
+            fprintf(stderr, "pacman recurrence runner: a symjit row, but this runner has no symjit kernels\n");
+            return nullptr;
+        }
+    std::vector<uint32_t> bindings;
+    std::vector<IOp> ops = program(rows, bindings);
+    for (const IOp &o : ops)
+        if ((o.w[0] & 0xff) == K_SYMJIT) {
+            uint32_t b = o.w[7];
+            if (b == UINT32_MAX || b + 4 > bindings.size() || bindings[b] >= (uint32_t)PACUDA_KERNEL_COUNT ||
+                bindings[b + 1] > PACUDA_MAX_IN || 2 * bindings[b + 2] > PACUDA_MAX_OUT ||
+                b + 4 + bindings[b + 1] + bindings[b + 2] > bindings.size()) {
+                fprintf(stderr, "pacman recurrence runner: a symjit row without a valid binding\n");
+                return nullptr;
+            }
+        }
     Prepared p{(uint32_t)ops.size(), nullptr};
+    if (!bindings.empty() &&
+        (failed(cudaMalloc((void **)&p.bindings, bindings.size() * sizeof(uint32_t)), "bindings") ||
+         failed(cudaMemcpy(p.bindings, bindings.data(), bindings.size() * sizeof(uint32_t), cudaMemcpyHostToDevice),
+                "bindings")))
+        return nullptr;
     while (p.sources < ops.size() && (ops[p.sources].w[0] & 0xff) == K_SOURCE) p.sources++;
     for (size_t n = p.sources; n < ops.size(); n++)
         if ((ops[n].w[0] & 0xff) == K_SOURCE) {
@@ -1023,12 +1182,15 @@ const Prepared *prepare(const pacman_recurrence_call *call) {
         return nullptr;
     if (call->words_key) return &(prepared_programs[call->words_key] = p);
     if (scratch.ops) cudaFree(scratch.ops);
+    if (scratch.bindings) cudaFree(scratch.bindings);
     scratch = p;
     return &scratch;
 }
 
-bool launch(const Prepared &p, const Arena &a, uint32_t points) {
+bool launch(const Prepared &p, const Arena &arena, uint32_t points) {
     Options o = options();
+    Arena a = arena;
+    a.bind = p.bindings;
     unsigned block = (unsigned)o.block, grid = (points + block - 1) / block;
     const IOp *ops = p.ops + p.sources;
     uint32_t count = p.count - p.sources;
@@ -1265,6 +1427,7 @@ static int run_locked(const pacman_recurrence_call *in) {
     }
 
     Arena a;
+    a.bind = nullptr;
     a.cre = device.cre;
     a.cim = device.cim;
     a.fcre = device.fcre;
@@ -1441,7 +1604,17 @@ extern "C" int pacman_recurrence_v1_run(const pacman_recurrence_call *in) {
 }
 
 extern "C" uint32_t pacman_recurrence_v1_capabilities(void) {
-    return PACMAN_RECURRENCE_CAP_SOURCES | PACMAN_RECURRENCE_CAP_FORMS;
+    return PACMAN_RECURRENCE_CAP_SOURCES | PACMAN_RECURRENCE_CAP_FORMS |
+           (PACUDA_KERNEL_COUNT > 0 ? PACMAN_RECURRENCE_CAP_SYMJIT : 0u);
+}
+
+// The index of the symjit kernel whose `.plane.symjit` has this SHA-256 (64 hex digits, either
+// case), or -1 if the runner was built without it.
+extern "C" int pacman_recurrence_v1_symjit_kernel(const char *sha256_hex) {
+    if (!sha256_hex) return -1;
+    for (int k = 0; k < PACUDA_KERNEL_COUNT; k++)
+        if (!strcasecmp(pacuda_kernel_sha256[k], sha256_hex)) return k;
+    return -1;
 }
 
 // Test only: the source wavefunctions of `count` (template code, mass, momentum) items, evaluated

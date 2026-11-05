@@ -11,5 +11,6 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+sha2 = "0.10"
 # the saved MIR (`symjit::backend`) and, for `check`, symjit's CPU kernels
 symjit = { version = "=2.28.3", default-features = false }
