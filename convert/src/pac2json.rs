@@ -165,7 +165,7 @@ fn conventions() -> J {
         ("points", s("every program is evaluated per phase-space point; all values below are per point")),
         (
             "names",
-            s("c<i>: a current (currents[i]); c<i>[k]: its component k (c<i> alone: component 0 or, as an operand, the whole current); \
+            s("c<i>: a current (currents[i]); c<i>[j]: its component j (c<i> alone: component 0 or, as an operand, the whole current); \
                a<i>: an amplitude (amplitudes[i]); q<i>: a momentum form (inputs.forms[i]); s<i>: a scale (inputs.scales[i]); \
                x<i>: an exact factor (inputs.factors[i]); b<i>: a symjit binding (bindings[i]); k<i>: a symjit kernel (kernels[i]); \
                p<l>: the momentum of external leg l"),
@@ -199,38 +199,47 @@ fn conventions() -> J {
 fn instructions() -> J {
     o(vec![
         (
+            "notation",
+            s("an instruction's operands are its fields: in[0], in[1] (input currents), out (output current), current (a current \
+               changed in place), momenta[0], momenta[1] and momentum (forms), amplitude; x[j] is component j of operand x \
+               (complex for currents, real for momenta: [E, px, py, pz]); j counts components from 0. In the formulas below \
+               l = in[0], r = in[1], o = the value computed, c = current, k = momentum, u = momenta[0], v = momenta[1]; \
+               i is the imaginary unit"),
+        ),
+        (
             "vertex",
             o(vec![
-                ("meaning", s("out[k] (mode)= V_type(in[0], in[1], momenta)[k] × coupling × factor, k < the type's output components")),
-                ("weyl_vector_a", s("in[0] Weyl (2), in[1] vector (4) → Weyl (2): o0 = -i l0 r3 - i l1 r1 + l1 r2 + i l0 r0, o1 = -l0 r2 - i l0 r1 + i l1 r0 + i l1 r3")),
-                ("weyl_vector_b", s("Weyl (2), vector (4) → Weyl (2): o0 = -l1 r2 + i l0 r0 + i l0 r3 + i l1 r1, o1 = -i l1 r3 + l0 r2 + i l0 r1 + i l1 r0")),
-                ("tensor_vector", s("antisymmetric tensor (6), vector (4) → vector (4): o0 = l0 r1 + l1 r2 + l2 r3, o1 = l0 r0 + l3 r2 + l4 r3, o2 = l1 r0 - l3 r1 + l5 r3, o3 = l2 r0 - l4 r1 - l5 r2")),
-                ("vector_wedge", s("vector (4), vector (4) → antisymmetric tensor (6): (l0 r1 - l1 r0, l0 r2 - l2 r0, l0 r3 - l3 r0, l1 r2 - l2 r1, l1 r3 - l3 r1, l2 r3 - l3 r2)")),
-                ("three_vector", s("vector (4), vector (4) → vector (4), colour-ordered three-gluon: o[k] = (l·r)(q0[k] - q1[k]) + 2((l·q1) r[k] - (r·q0) l[k]), q0, q1 = momenta[0], momenta[1]")),
+                ("meaning", s("out[j] (mode)= o[j] × coupling × factor for each component j of the type's output")),
+                ("weyl_vector_a", s("l Weyl (2), r vector (4) → Weyl (2): o[0] = -i l[0] r[3] - i l[1] r[1] + l[1] r[2] + i l[0] r[0], o[1] = -l[0] r[2] - i l[0] r[1] + i l[1] r[0] + i l[1] r[3]")),
+                ("weyl_vector_b", s("l Weyl (2), r vector (4) → Weyl (2): o[0] = -l[1] r[2] + i l[0] r[0] + i l[0] r[3] + i l[1] r[1], o[1] = -i l[1] r[3] + l[0] r[2] + i l[0] r[1] + i l[1] r[0]")),
+                ("tensor_vector", s("l antisymmetric tensor (6), r vector (4) → vector (4): o[0] = l[0] r[1] + l[1] r[2] + l[2] r[3], o[1] = l[0] r[0] + l[3] r[2] + l[4] r[3], o[2] = l[1] r[0] - l[3] r[1] + l[5] r[3], o[3] = l[2] r[0] - l[4] r[1] - l[5] r[2]")),
+                ("vector_wedge", s("l vector (4), r vector (4) → antisymmetric tensor (6): o = (l[0] r[1] - l[1] r[0], l[0] r[2] - l[2] r[0], l[0] r[3] - l[3] r[0], l[1] r[2] - l[2] r[1], l[1] r[3] - l[3] r[1], l[2] r[3] - l[3] r[2])")),
+                ("three_vector", s("l vector (4), r vector (4) → vector (4), the colour-ordered three-gluon vertex: o[j] = (l·r)(u[j] - v[j]) + 2((l·v) r[j] - (r·u) l[j])")),
+                ("momenta", s("read by three_vector only; for the other types they are the momenta the inputs carry")),
             ]),
         ),
         (
             "propagator",
             o(vec![
-                ("meaning", s("current (in place) = P_type(current, momentum) × factor / (momentum·momentum)")),
-                ("weyl_a", s("Weyl (2): o0 = -i c0 p3 - i c1 p1 + c1 p2 + i c0 p0, o1 = -c0 p2 - i c0 p1 + i c1 p0 + i c1 p3")),
-                ("weyl_b", s("Weyl (2): o0 = -c1 p2 + i c0 p0 + i c0 p3 + i c1 p1, o1 = -i c1 p3 + c0 p2 + i c0 p1 + i c1 p0")),
-                ("vector", s("vector (4), Feynman gauge: o[k] = -i c[k]")),
+                ("meaning", s("current[j] = o[j] × factor / (k·k) for each component j")),
+                ("weyl_a", s("c Weyl (2): o[0] = -i c[0] k[3] - i c[1] k[1] + c[1] k[2] + i c[0] k[0], o[1] = -c[0] k[2] - i c[0] k[1] + i c[1] k[0] + i c[1] k[3]")),
+                ("weyl_b", s("c Weyl (2): o[0] = -c[1] k[2] + i c[0] k[0] + i c[0] k[3] + i c[1] k[1], o[1] = -i c[1] k[3] + c[0] k[2] + i c[0] k[1] + i c[1] k[0]")),
+                ("vector", s("c vector (4), Feynman gauge: o[j] = -i c[j]")),
             ]),
         ),
-        ("scale", s("current[k] = factor × current[k], k < components")),
-        ("clear", s("current[k] = 0, k < components")),
-        ("closure", s("amplitude += Σ_k in[0][k] × in[1][k] × component_factors[k] × factor, k < components")),
+        ("scale", s("current[j] = factor × current[j], j < components")),
+        ("clear", s("current[j] = 0, j < components")),
+        ("closure", s("amplitude += Σ_j in[0][j] × in[1][j] × component_factors[j] × factor, j < components")),
         ("source", s("current = factor × the external wavefunction (RustiCol's wavefunctions.rs) of the leg's momentum")),
         (
             "kernel",
-            s("the symjit kernel of the binding on the binding's inputs (in f64), its j-th output pair (re, im) × factor (mode)= \
-               out[binding.outputs[j]]; with binding.direct and factor exactly 1 the pair is stored as it is"),
+            s("the symjit kernel of the binding on the binding's inputs (in f64); its output pair n (re, im) × factor (mode)= \
+               out[binding.outputs[n]]; with binding.direct and factor exactly 1 the pair is stored as it is"),
         ),
         (
             "binding inputs",
-            s("re|im in0[k], in1[k]: a component of the row's in[0], in[1]; re|im out[k]: of its out; mom0[k], mom1[k]: of its momenta[0], momenta[1]; \
-               s<i>: the real part of scale s<i>; re|im factor: of the row's factor"),
+            s("re|im in[0][j], re|im in[1][j], re|im out[j]: a part of a component of the kernel row's operands; momenta[0][j], \
+               momenta[1][j]: a component of its momenta; s<i>: the real part of scale s<i>; re|im factor: of its factor"),
         ),
     ])
 }
@@ -461,9 +470,9 @@ fn input_code(c: u32) -> Result<String> {
     let (kind, which, im, n) = (c & 7, (c >> 3) & 1, (c >> 4) & 1, c >> 5);
     let part = if im == 1 { "im" } else { "re" };
     Ok(match kind {
-        B_PARENT => format!("{part} in{which}[{n}]"),
+        B_PARENT => format!("{part} in[{which}][{n}]"),
         B_DESTINATION if which == 0 => format!("{part} out[{n}]"),
-        B_MOMENTUM if im == 0 => format!("mom{which}[{n}]"),
+        B_MOMENTUM if im == 0 => format!("momenta[{which}][{n}]"),
         B_SCALE if im == 0 && which == 0 => format!("s{n}"),
         B_FACTOR if which == 0 && n == 0 => format!("{part} factor"),
         _ => bail!("binding input code {c:#x}: not one pac2json writes"),
@@ -481,12 +490,12 @@ fn parse_input_code(text: &str) -> Result<u32> {
         r.strip_prefix(prefix).and_then(|t| t.strip_suffix(']')).ok_or_else(bad)?.parse().map_err(|_| bad())
     };
     Ok(match (part, rest) {
-        (Some(_), r) if r.starts_with("in0[") => B_PARENT | im << 4 | index(r, "in0[")? << 5,
-        (Some(_), r) if r.starts_with("in1[") => B_PARENT | 1 << 3 | im << 4 | index(r, "in1[")? << 5,
+        (Some(_), r) if r.starts_with("in[0][") => B_PARENT | im << 4 | index(r, "in[0][")? << 5,
+        (Some(_), r) if r.starts_with("in[1][") => B_PARENT | 1 << 3 | im << 4 | index(r, "in[1][")? << 5,
         (Some(_), r) if r.starts_with("out[") => B_DESTINATION | im << 4 | index(r, "out[")? << 5,
         (Some(_), "factor") => B_FACTOR | im << 4,
-        (None, r) if r.starts_with("mom0[") => B_MOMENTUM | index(r, "mom0[")? << 5,
-        (None, r) if r.starts_with("mom1[") => B_MOMENTUM | 1 << 3 | index(r, "mom1[")? << 5,
+        (None, r) if r.starts_with("momenta[0][") => B_MOMENTUM | index(r, "momenta[0][")? << 5,
+        (None, r) if r.starts_with("momenta[1][") => B_MOMENTUM | 1 << 3 | index(r, "momenta[1][")? << 5,
         (None, r) if r.starts_with('s') => B_SCALE | r[1..].parse::<u32>().map_err(|_| bad())? << 5,
         _ => bail!(bad()),
     })
