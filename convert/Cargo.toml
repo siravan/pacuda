@@ -9,9 +9,14 @@ description = "Records pyAmpliCol recurrence plan runs (the patched RustiCol's r
 name = "pacuda-convert"
 path = "src/main.rs"
 
+[[bin]]
+name = "pac2json"
+path = "src/pac2json.rs"
+
 [dependencies]
 anyhow = "1"
 libloading = "0.9"
+serde_json = "1"
 # the patched RustiCol (rusticol/prepare.sh: pyAmpliCol at rusticol/UPSTREAM with rusticol/patches),
 # its record mode (feature pacman); used only to convert
 rusticol-core = { path = "../build/rusticol/pyamplicol/rust/crates/rusticol-core", features = ["pacman"] }

@@ -314,6 +314,7 @@ dependencies = [
  "anyhow",
  "libloading",
  "rusticol-core",
+ "serde_json",
 ]
 
 [[package]]

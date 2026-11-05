@@ -22,6 +22,12 @@ bit (f64 kernel). See `symjit-playground/plans/pacman-ptx/PACUDA.md` for the des
 - `convert/`: `pacuda-convert` (`convert/build.sh [MADGRAPH7_REPO]`: prepares the RustiCol, then
   cargo builds; toolchain 1.99.1). `convert LC_DIR -o FILE.pacuda [--kernels DIR]`,
   `check FILE --runner librecurrence.so`, `record LC_DIR [--replay ...]`. Used only to convert.
+  The same crate builds `pac2json`, a human-readable copy of an artifact's recurrence programs:
+  `pac2json LC_DIR -o DIR` writes `DIR/main.json` (per (process, colour): the inputs, the outputs,
+  the currents with their initial values, the body, the reduction; a legend under `configs`),
+  `DIR/examples.json` (reference momenta and the CPU's outputs) and `DIR/kernels/` (the symjit
+  kernels), and checks that they read back as the recording; `pac2json pack DIR -o FILE.pacuda`
+  rebuilds the `.pacuda` file from them (for `pacuda-convert check`).
 - `umami/`: `umami_pacuda.c`, the UMAMI library (`umami/build.sh UMAMI_DIR RUNNER_DIR OUT.so`).
 - `pacuda.py retarget OUTPUT [--kernel ...]` / `undo OUTPUT`: an mg7 output on pacuda, or back.
 - `tests/`: `runner_variants.sh` (the runner's kernels), `compare_umami.py` (pacuda's UMAMI library
