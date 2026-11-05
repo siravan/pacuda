@@ -4,13 +4,15 @@
 //! count, every string by its byte length (u32, no NUL).
 //!
 //! ```text
-//! file      magic "PACUDA\0\x01", u32 version (1), u32 kernel (runner configuration: 0 df64,
+//! file      magic "PACUDA\0\x01", u32 version (2), u32 kernel (runner configuration: 0 df64,
 //!           1 f64, 2 mixed, 3 mixed64), u32 batch (points per runner call, 0: each template's
 //!           tile), u32 n, n × 64 hex bytes: the SHA-256s of
 //!           the symjit kernels (an op 14 word's kernel index is a position here; the wrapper
 //!           maps them to the runner's indices), u32 processes, the processes
 //! process   str key, u32 legs, u32 helicities, str alpha_s parameter ("" if none), f64 its value
-//!           at conversion, i32 QCD power (|M|² ∝ alpha_s^power), i64 group factor numerator,
+//!           at conversion, i32 QCD power (|M|² ∝ alpha_s^power), u32 parameters, per parameter
+//!           str name, f64 real, f64 imaginary (the model parameters set at conversion: mg7's
+//!           param-card values), i64 group factor numerator,
 //!           i64 denominator (values · num / den when they differ), u32 crossing (0, or legs:
 //!           then legs × (u32 input leg, f64 sign)), u32 colours, the colours
 //! colour    str colour id, the run template, the reduction, the reference
@@ -31,7 +33,7 @@ use std::io::Write;
 use anyhow::{anyhow, bail, Result};
 
 pub const MAGIC: &[u8; 8] = b"PACUDA\0\x01";
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Template {
@@ -78,6 +80,8 @@ pub struct Process {
     pub alpha_s_name: String,
     pub alpha_s: f64,
     pub qcd_power: i32,
+    /// the model parameters set before recording (name, real, imaginary)
+    pub parameters: Vec<(String, f64, f64)>,
     pub factor: (i64, i64),
     pub crossing: Option<Vec<(u32, f64)>>,
     pub colours: Vec<Colour>,
@@ -148,6 +152,12 @@ impl File {
             o.str(&p.alpha_s_name);
             o.f64(p.alpha_s);
             o.i32(p.qcd_power);
+            o.u32(p.parameters.len() as u32);
+            for (name, re, im) in &p.parameters {
+                o.str(name);
+                o.f64(*re);
+                o.f64(*im);
+            }
             o.i64(p.factor.0);
             o.i64(p.factor.1);
             match &p.crossing {
@@ -226,6 +236,11 @@ impl File {
             let alpha_s_name = r.str()?;
             let alpha_s = r.f64()?;
             let qcd_power = r.i32()?;
+            let parameters_n = r.u32()? as usize;
+            let mut parameters = Vec::with_capacity(parameters_n);
+            for _ in 0..parameters_n {
+                parameters.push((r.str()?, r.f64()?, r.f64()?));
+            }
             let factor = (r.i64()?, r.i64()?);
             let crossing_n = r.u32()? as usize;
             let crossing = if crossing_n == 0 {
@@ -292,7 +307,7 @@ impl File {
                     reference_values,
                 });
             }
-            processes.push(Process { key, legs, helicities, alpha_s_name, alpha_s, qcd_power, factor, crossing, colours });
+            processes.push(Process { key, legs, helicities, alpha_s_name, alpha_s, qcd_power, parameters, factor, crossing, colours });
         }
         if r.at != bytes.len() {
             bail!("{} bytes after the last process", bytes.len() - r.at);

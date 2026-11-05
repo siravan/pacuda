@@ -1,5 +1,5 @@
 """One mg7 [amplicol] run, as test_mg7_amplicol runs it, optionally on pacuda.
-usage (from the MadGraph root): mg7_run.py RUN_DIR [--pacuda KERNEL] [--reuse] 'proc1' ['proc2' ...]
+usage (from the MadGraph root): mg7_run.py RUN_DIR [--pacuda KERNEL [--batch N]] [--reuse] 'proc1' ['proc2' ...]
 Generates the output (unless --reuse and it exists), applies the test's run-card edits,
 retargets it to pacuda with KERNEL (pacuda.py retarget), runs generate_events and prints the
 cross section. The output is kept."""
@@ -9,11 +9,14 @@ sys.path.insert(0, os.getcwd())
 args = sys.argv[1:]
 run_dir = os.path.abspath(args.pop(0))
 kernel = None
+batch = None
 reuse = False
 while args and args[0].startswith("--"):
     flag = args.pop(0)
     if flag == "--pacuda":
         kernel = args.pop(0)
+    elif flag == "--batch":
+        batch = args.pop(0)
     elif flag == "--reuse":
         reuse = True
 procs = args
@@ -36,13 +39,19 @@ if not reuse:
 t1 = time.time()
 pacuda = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pacuda.py")
 if kernel:
-    subprocess.check_call([sys.executable, pacuda, "retarget", run_dir, "--kernel", kernel])
+    subprocess.check_call([sys.executable, pacuda, "retarget", run_dir, "--kernel", kernel]
+                          + (["--batch", batch] if batch else []))
 t2 = time.time()
+before = set(glob.glob(os.path.join(run_dir, "Events", "*", "info.json")))
 with open(os.path.join(run_dir, "generate_events.log"), "w") as log:
     status = subprocess.call([sys.executable, os.path.join(run_dir, "bin", "generate_events"), "-f"],
                              cwd=run_dir, stdout=log, stderr=subprocess.STDOUT)
 t3 = time.time()
-infos = sorted(glob.glob(os.path.join(run_dir, "Events", "*", "info.json")))
-r = json.load(open(infos[-1]))["process"] if infos else {}
+infos = sorted(set(glob.glob(os.path.join(run_dir, "Events", "*", "info.json"))) - before)
+if not infos:
+    print("%s pacuda=%s FAILED: no new run (see %s)" % (
+        os.path.basename(run_dir), kernel, os.path.join(run_dir, "generate_events.log")))
+    sys.exit(1)
+r = json.load(open(infos[-1]))["process"]
 print("%s pacuda=%s status=%d output=%.1fs retarget=%.1fs run=%.1fs mean=%r error=%r done=%r" % (
     os.path.basename(run_dir), kernel, status, t1 - t0, t2 - t1, t3 - t2, r.get("mean"), r.get("error"), r.get("done")))

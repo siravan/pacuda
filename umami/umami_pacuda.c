@@ -74,6 +74,9 @@ typedef struct {
     char *alpha_s_name;
     double alpha_s;
     int32_t qcd_power;
+    uint32_t parameter_count;
+    char **parameter_names; /* the model parameters set at conversion, and their values */
+    double *parameter_re, *parameter_im;
     int64_t numerator, denominator;
     uint32_t *crossing_leg; /* NULL: identity */
     double *crossing_sign;
@@ -130,6 +133,8 @@ static void free_file(PFile *f) {
             free(c->term_coefficients); free(c->offsets); free(c->planes); free(c->weights);
             free(c->reference_momenta); free(c->reference_values);
         }
+        for (uint32_t k = 0; p->parameter_names && k < p->parameter_count; k++) free(p->parameter_names[k]);
+        free(p->parameter_names); free(p->parameter_re); free(p->parameter_im);
         free(p->colours); free(p->key); free(p->alpha_s_name); free(p->crossing_leg); free(p->crossing_sign);
     }
     free(f->processes); free(f->sha); free(f);
@@ -151,8 +156,8 @@ static PFile *read_file(const char *path) {
     Reader r = {bytes, bytes + size, 0};
     PFile *f = calloc(1, sizeof *f);
     char magic[8];
-    if (!f || !take(&r, magic, 8) || memcmp(magic, "PACUDA\0\x01", 8) || rd_u32(&r) != 1) {
-        fprintf(stderr, "pacuda: %s: not a version-1 .pacuda file\n", path);
+    if (!f || !take(&r, magic, 8) || memcmp(magic, "PACUDA\0\x01", 8) || rd_u32(&r) != 2) {
+        fprintf(stderr, "pacuda: %s: not a version-2 .pacuda file (convert it again)\n", path);
         free(bytes); free(f);
         return NULL;
     }
@@ -177,6 +182,17 @@ static PFile *read_file(const char *path) {
         p->alpha_s_name = rd_str(&r);
         p->alpha_s = rd_f64(&r);
         p->qcd_power = rd_i32(&r);
+        p->parameter_count = rd_u32(&r);
+        if (p->parameter_count > (size_t)(r.end - r.p) / 20) { r.bad = 1; break; }
+        p->parameter_names = calloc(p->parameter_count ? p->parameter_count : 1, sizeof(char *));
+        p->parameter_re = calloc(p->parameter_count ? p->parameter_count : 1, sizeof(double));
+        p->parameter_im = calloc(p->parameter_count ? p->parameter_count : 1, sizeof(double));
+        if (!p->parameter_names || !p->parameter_re || !p->parameter_im) { r.bad = 1; break; }
+        for (uint32_t k = 0; !r.bad && k < p->parameter_count; k++) {
+            p->parameter_names[k] = rd_str(&r);
+            p->parameter_re[k] = rd_f64(&r);
+            p->parameter_im[k] = rd_f64(&r);
+        }
         p->numerator = rd_i64(&r);
         p->denominator = rd_i64(&r);
         uint32_t crossing = rd_u32(&r);
@@ -304,6 +320,18 @@ static UmamiParameter const *parameter(size_t process, char const *name) {
     for (size_t i = 0; i < entry->parameter_count; ++i)
         if (strcmp(entry->parameters[i].name, name) == 0) return &entry->parameters[i];
     return NULL;
+}
+
+/* A model parameter's value at conversion: the file's (set from mg7's param card), else the
+ * provider's default (the artifact's). */
+static void converted_value(const PProcess *p, UmamiParameter const *entry, double *re, double *im) {
+    *re = entry->real;
+    *im = entry->imaginary;
+    for (uint32_t k = 0; p && k < p->parameter_count; k++)
+        if (strcmp(p->parameter_names[k], entry->name) == 0) {
+            *re = p->parameter_re[k];
+            *im = p->parameter_im[k];
+        }
 }
 
 static const PColour *colour_of(const Instance *instance, const UmamiContribution *c) {
@@ -461,8 +489,10 @@ UmamiStatus umami_get_parameter(UmamiHandle handle, char const *name, double *re
         if (entry->is_complex && imaginary == NULL) return UMAMI_ERROR;
         const PProcess *p = instance->process[i];
         bool alpha = p && p->alpha_s_name[0] && strcmp(p->alpha_s_name, name) == 0;
-        *real = alpha ? instance->alpha_s[i] : entry->real;
-        if (imaginary != NULL) *imaginary = alpha ? 0.0 : entry->imaginary;
+        double re, im;
+        converted_value(p, entry, &re, &im);
+        *real = alpha ? instance->alpha_s[i] : re;
+        if (imaginary != NULL) *imaginary = alpha ? 0.0 : im;
         return UMAMI_SUCCESS;
     }
     return UMAMI_ERROR;
@@ -484,9 +514,11 @@ UmamiStatus umami_set_parameter(UmamiHandle handle, char const *name, double rea
             if (!(real >= 0.0)) return UMAMI_ERROR;
             continue;
         }
-        if (real != entry->real || (entry->is_complex && imaginary != entry->imaginary)) {
+        double re, im;
+        converted_value(p, entry, &re, &im);
+        if (real != re || (entry->is_complex && imaginary != im)) {
             fprintf(stderr, "pacuda: %s = %.17g: the file was converted with %.17g; convert it again "
-                            "with this parameter card\n", name, real, entry->real);
+                            "with this parameter card\n", name, real, re);
             return UMAMI_ERROR;
         }
     }

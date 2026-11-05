@@ -3,10 +3,13 @@
 //! recurrence plan runs as an mg7 UMAMI library evaluates them, with the record mode of the
 //! patched RustiCol (no GPU needed).
 //!
-//!   pacuda-convert convert LC_DIR -o OUT.pacuda [--kernels DIR] [--kernel K] [--batch N] [-n POINTS]
+//!   pacuda-convert convert LC_DIR -o OUT.pacuda [--parameters FILE.json] [--kernels DIR] [--kernel K] [--batch N] [-n POINTS]
 //!   pacuda-convert check FILE.pacuda --runner librecurrence.so [--kernel K] [--tile T] [--host-reduce]
 //!   pacuda-convert record LC_DIR [-n POINTS] [--replay librecurrence.so] [--kernel K] [--host-reduce]
 //!
+//! `--parameters FILE.json` ({"name": value}): the model parameters mg7 sets on the library (its
+//! param card's values, `amplicol_parameters`), set on every runtime before recording; the
+//! file records them (the wrapper accepts only these values).
 //! `convert`: for each (process, colour id) the artifact's UMAMI provider (`API/umami/provider_p0.h`)
 //! uses, one resolved evaluation of POINTS random points (default 1000) under recording; the
 //! checks (`check_recording`); the run template (identical across the recorded tiles), the
@@ -81,12 +84,25 @@ pub struct Recorded {
     pub recording: PacmanRecording,
 }
 
-fn load(lc: &Path, process: &str) -> Result<NativeRuntime> {
-    NativeRuntime::load(lc, Some(process), None).map_err(|e| anyhow!("{}: loading {}: {}", lc.display(), process, e))
+/// The runtime of `process` with `parameters` set (those it has), and the ones set.
+fn load(lc: &Path, process: &str, parameters: &[(String, f64)]) -> Result<(NativeRuntime, Vec<(String, f64, f64)>)> {
+    let mut runtime =
+        NativeRuntime::load(lc, Some(process), None).map_err(|e| anyhow!("{}: loading {}: {}", lc.display(), process, e))?;
+    let mut set = Vec::new();
+    for (name, value) in parameters {
+        if runtime.model_parameter_value(name).is_err() {
+            continue;
+        }
+        runtime
+            .set_model_parameter(name, *value, 0.0)
+            .map_err(|e| anyhow!("{process}: setting {name} = {value}: {e}"))?;
+        set.push((name.clone(), *value, 0.0));
+    }
+    Ok((runtime, set))
 }
 
-pub fn record_one(lc: &Path, process: &str, color: &str, points: usize) -> Result<Recorded> {
-    let mut runtime = load(lc, process)?;
+pub fn record_one(lc: &Path, process: &str, color: &str, points: usize, parameters: &[(String, f64)]) -> Result<Recorded> {
+    let (mut runtime, _) = load(lc, process, parameters)?;
     let n = runtime.external_count();
     let momenta = momenta(n, points, 0x5eed_0000 + points as u64);
     let colors = vec![color.to_string()];
@@ -216,7 +232,7 @@ fn colour_of(id: &str, r: &Recorded, kernels: &mut Vec<String>, reference: usize
         })
 }
 
-fn process_of(key: &str, r: &Recorded, alpha_s_name: &str, alpha_s: f64, qcd_power: i32) -> format::Process {
+fn process_of(key: &str, r: &Recorded, alpha_s_name: &str, alpha_s: f64, qcd_power: i32, parameters: Vec<(String, f64, f64)>) -> format::Process {
     format::Process {
         key: key.to_string(),
         legs: r.external_count as u32,
@@ -224,6 +240,7 @@ fn process_of(key: &str, r: &Recorded, alpha_s_name: &str, alpha_s: f64, qcd_pow
         alpha_s_name: alpha_s_name.to_string(),
         alpha_s,
         qcd_power,
+        parameters,
         factor: r.group_factor,
         crossing: r.crossing.as_ref().map(|c| c.iter().map(|&(l, s)| (l as u32, s)).collect()),
         colours: Vec::new(),
@@ -232,8 +249,8 @@ fn process_of(key: &str, r: &Recorded, alpha_s_name: &str, alpha_s: f64, qcd_pow
 
 /// alpha_s0 and the power p of |M|² ∝ alpha_s^p, from the CPU's totals at alpha_s0 and 2 alpha_s0
 /// (every point's ratio must be 2^p to 1e-12; else the process is refused).
-fn alpha_s_power(lc: &Path, process: &str, name: &str) -> Result<(f64, i32)> {
-    let mut runtime = load(lc, process)?;
+fn alpha_s_power(lc: &Path, process: &str, name: &str, parameters: &[(String, f64)]) -> Result<(f64, i32)> {
+    let (mut runtime, _) = load(lc, process, parameters)?;
     let (alpha, imaginary) = runtime.model_parameter_value(name).map_err(|e| anyhow!("{process}: {name}: {e}"))?;
     if imaginary != 0.0 || !(alpha > 0.0) {
         bail!("{process}: {name} = ({alpha}, {imaginary})");
@@ -277,6 +294,19 @@ fn extract_kernels(lc: &Path, sha256: &[String], dir: &Path) -> Result<usize> {
     Ok(found.len())
 }
 
+/// A flat JSON object of numbers, {"name": value, ...} (what pacuda.py writes).
+fn parse_parameters(text: &str) -> Result<Vec<(String, f64)>> {
+    let body = text.trim().strip_prefix('{').and_then(|t| t.strip_suffix('}')).ok_or_else(|| anyhow!("not a JSON object"))?;
+    let mut out = Vec::new();
+    for item in body.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let (name, value) = item.split_once(':').ok_or_else(|| anyhow!("bad entry {item}"))?;
+        let name = name.trim().trim_matches('"').to_string();
+        let value: f64 = value.trim().parse().map_err(|_| anyhow!("{name}: not a number: {value}"))?;
+        out.push((name, value));
+    }
+    Ok(out)
+}
+
 fn kernel_number(name: Option<&String>) -> Result<u32> {
     Ok(match name.map(String::as_str) {
         Some("df64") => 0,
@@ -293,6 +323,7 @@ fn main() {
         let command = args.first().ok_or_else(|| anyhow!("usage: pacuda-convert convert|check|record ..."))?;
         let mut paths = Vec::<PathBuf>::new();
         let (mut points, mut out, mut kernels_dir, mut runner_path) = (None::<usize>, None::<PathBuf>, None::<PathBuf>, None::<PathBuf>);
+        let mut parameters: Vec<(String, f64)> = Vec::new();
         let (mut kernel, mut batch, mut tile, mut host_reduce) = (None::<u32>, 0u32, None::<usize>, false);
         let mut it = args[1..].iter();
         while let Some(a) = it.next() {
@@ -300,6 +331,11 @@ fn main() {
                 "-n" => points = Some(it.next().ok_or_else(|| anyhow!("-n needs a value"))?.parse()?),
                 "-o" => out = it.next().map(PathBuf::from),
                 "--kernels" => kernels_dir = it.next().map(PathBuf::from),
+                "--parameters" => {
+                    let path = it.next().ok_or_else(|| anyhow!("--parameters needs a file"))?;
+                    parameters = parse_parameters(&std::fs::read_to_string(path).map_err(|e| anyhow!("{path}: {e}"))?)
+                        .map_err(|e| anyhow!("{path}: {e}"))?;
+                }
                 "--runner" | "--replay" => runner_path = it.next().map(PathBuf::from),
                 "--kernel" => kernel = Some(kernel_number(it.next())?),
                 "--batch" => batch = it.next().ok_or_else(|| anyhow!("--batch needs a value"))?.parse()?,
@@ -326,23 +362,24 @@ fn main() {
                     if colours.is_empty() {
                         continue;
                     }
+                    let (_, set) = load(lc, key, &parameters)?;
                     let (alpha_s_name, alpha_s, qcd_power) = match &provider.alpha_s[index] {
                         Some(name) => {
-                            let (a, p) = alpha_s_power(lc, key, name)?;
+                            let (a, p) = alpha_s_power(lc, key, name, &parameters)?;
                             (name.clone(), a, p)
                         }
                         None => (String::new(), 0.0, 0),
                     };
                     let mut process: Option<format::Process> = None;
                     for color in colours {
-                        let r = record_one(lc, key, color, points)?;
+                        let r = record_one(lc, key, color, points, &parameters)?;
                         let problems = check_recording(&r, points);
                         if !problems.is_empty() {
                             bail!("{key} {color}: {}", problems.join("; "));
                         }
                         let c = colour_of(color, &r, &mut file.symjit_sha256, 8)?;
                         process
-                            .get_or_insert_with(|| process_of(key, &r, &alpha_s_name, alpha_s, qcd_power))
+                            .get_or_insert_with(|| process_of(key, &r, &alpha_s_name, alpha_s, qcd_power, set.clone()))
                             .colours
                             .push(c);
                     }
@@ -419,14 +456,14 @@ fn main() {
                 let runner = runner_path.as_deref().map(|p| replay::Runner::load(p, kernel)).transpose()?;
                 let mut failed = 0;
                 for (process, color) in provider.used_pairs() {
-                    let r = record_one(lc, &process, &color, points)?;
+                    let r = record_one(lc, &process, &color, points, &parameters)?;
                     let mut problems = check_recording(&r, points);
                     let mut compared = String::new();
                     if let (Some(runner), true) = (&runner, problems.is_empty()) {
                         let mut kernels = Vec::new();
                         let c = colour_of(&color, &r, &mut kernels, points)?;
                         let stride = c.template.tile;
-                        let p = process_of(&process, &r, "", 0.0, 0);
+                        let p = process_of(&process, &r, "", 0.0, 0, Vec::new());
                         let map = runner.kernel_map(&kernels)?;
                         match replay::evaluate(runner, &map, &p, &c, &r.momenta, points, stride as usize, host_reduce) {
                             Ok(values) => {
