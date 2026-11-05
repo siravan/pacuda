@@ -10,6 +10,8 @@ use anyhow::{anyhow, bail, Result};
 
 pub struct Provider {
     pub processes: Vec<String>,
+    /// per process, its alpha_s parameter (`alpha_s_name`), if it has one
+    pub alpha_s: Vec<Option<String>>,
     /// (process index, colour id) of each contribution, in header order
     pub contributions: Vec<(usize, String)>,
 }
@@ -25,6 +27,7 @@ impl Provider {
     pub fn read(path: &Path) -> Result<Provider> {
         let text = std::fs::read_to_string(path).map_err(|e| anyhow!("{}: {}", path.display(), e))?;
         let mut processes = Vec::new();
+        let mut alpha_s = Vec::new();
         let mut contributions = Vec::new();
         #[derive(PartialEq)]
         enum In {
@@ -49,8 +52,11 @@ impl Provider {
             }
             match state {
                 In::Processes if t.starts_with('{') => {
-                    let (key, _) = quoted(t).ok_or_else(|| anyhow!("{}: a process without a key: {t}", path.display()))?;
+                    let (key, rest) = quoted(t).ok_or_else(|| anyhow!("{}: a process without a key: {t}", path.display()))?;
                     processes.push(key.to_string());
+                    // {"key", pdgs, "aS" | NULL, ...}: the third field
+                    let third = rest.split(',').nth(2).map(str::trim).unwrap_or("");
+                    alpha_s.push(third.strip_prefix('"').and_then(|v| v.strip_suffix('"')).map(str::to_string));
                 }
                 In::Contributions if t.starts_with('{') => {
                     let index: usize = t[1..]
@@ -70,7 +76,7 @@ impl Provider {
         if let Some((index, _)) = contributions.iter().find(|(i, _)| *i >= processes.len()) {
             bail!("{}: a contribution of process {index}, of {}", path.display(), processes.len());
         }
-        Ok(Provider { processes, contributions })
+        Ok(Provider { processes, alpha_s, contributions })
     }
 
     /// The distinct (process key, colour id) pairs of the contributions, sorted.
