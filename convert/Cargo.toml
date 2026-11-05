@@ -1,0 +1,16 @@
+[package]
+name = "pacuda-convert"
+version = "0.1.0"
+edition = "2024"
+license = "0BSD"
+description = "Records pyAmpliCol recurrence plan runs (the patched RustiCol's record mode) into .pacuda files"
+
+[[bin]]
+name = "pacuda-convert"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+libloading = "0.9"
+# the patched RustiCol (local e2e-pacman branch), offline only: its record mode (feature pacman)
+rusticol-core = { path = "../../mg7-e2e/pyamplicol/rust/crates/rusticol-core", features = ["pacman"] }
