@@ -95,7 +95,7 @@ int pacman_recurrence_v1_reduce(const pacman_recurrence_reduce *reduce);
 // bit 0: op 12 (sources on the device); bit 1: PACMAN_RECURRENCE_FORMS_ON_DEVICE
 #define PACMAN_RECURRENCE_CAP_SOURCES 1u
 #define PACMAN_RECURRENCE_CAP_FORMS 2u
-// The runner's configuration, set once before the first run (later calls fail):
+// The runner's configuration: before the first run; afterwards only the same one again:
 typedef struct {
     uint32_t abi_version;  // PACMAN_RECURRENCE_ABI
     uint32_t struct_size;

@@ -1659,18 +1659,22 @@ extern "C" int pacman_recurrence_v1_configure(const pacman_recurrence_options *o
         return PACMAN_RECURRENCE_INVALID;
     acquire_runner_lock();
     int status = PACMAN_RECURRENCE_OK;
-    if (runs_started) {
-        fprintf(stderr, "pacman recurrence runner: configure after the first run\n");
+    Options n;
+    n.kernel = (int)o->kernel;
+    n.df64 = n.kernel != KERNEL_F64;
+    n.df64_forms = n.kernel == KERNEL_DF64 || n.kernel == KERNEL_MIXED;
+    n.block = o->block ? (int)o->block : 128;
+    n.sort = !o->no_sort;
+    bool same = n.kernel == current_options.kernel && n.block == current_options.block &&
+                n.sort == current_options.sort;
+    // the same configuration again is fine (several UMAMI libraries of one output share the
+    // runner); another one only before the first run (the kernel fixes the arena's layout)
+    if (runs_started && !same) {
+        fprintf(stderr, "pacman recurrence runner: another configuration after the first run\n");
         status = PACMAN_RECURRENCE_INVALID;
     } else {
-        Options n;
-        n.kernel = (int)o->kernel;
-        n.df64 = n.kernel != KERNEL_F64;
-        n.df64_forms = n.kernel == KERNEL_DF64 || n.kernel == KERNEL_MIXED;
-        n.block = o->block ? (int)o->block : 128;
-        n.sort = !o->no_sort;
         current_options = n;
-        device.stats = o->stats != 0;
+        device.stats = device.stats || o->stats != 0;
     }
     release_runner_lock();
     return status;
