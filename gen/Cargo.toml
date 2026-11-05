@@ -1,0 +1,15 @@
+[package]
+name = "pacuda-gen"
+version = "0.1.0"
+edition = "2021"
+license = "0BSD"
+description = "CUDA device functions from pyAmpliCol's symjit plane kernels, for the pacuda recurrence runner"
+
+[[bin]]
+name = "pacuda-gen"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+# the saved MIR (`symjit::backend`) and, for `check`, symjit's CPU kernels
+symjit = { version = "=2.28.3", default-features = false }
