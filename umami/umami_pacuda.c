@@ -19,7 +19,8 @@
  * RustiCol's bit for bit (f64 kernel); the other two sum the same values in RustiCol's resolved
  * order rather than its selected-path order.
  *
- * Events are batched: every event's contributions are gathered by contribution, each batch is
+ * Events are batched: every event's contributions are gathered by (process, colour id, leg
+ * permutation), each batch is
  * evaluated in tiles (one runner call that keeps its amplitudes, one resolved reduction), then
  * the events are combined in order. alpha_s: |M|^2(a) = |M|^2(a0) (a/a0)^p with the file's a0
  * and p (exact for a = a0); the other mutable parameters can only be set to their values at
@@ -544,9 +545,21 @@ UmamiStatus umami_set_parameter(UmamiHandle handle, char const *name, double rea
     return UMAMI_SUCCESS;
 }
 
+/* Items evaluate alike when their contributions share the process, the colour id and the leg
+ * permutation (the factor, the helicity maps and the alpha_s scale are applied per item): one
+ * batch for all the flavours that do (as umami.c's batched path groups them). */
+static int compare_evaluation(const UmamiContribution *x, const UmamiContribution *y) {
+    if (x == y) return 0;
+    if (x->process_index != y->process_index) return x->process_index < y->process_index ? -1 : 1;
+    int c = strcmp(x->color_id, y->color_id);
+    if (c != 0) return c;
+    return memcmp(x->permutation, y->permutation, umami_provider.particle_count * sizeof(size_t));
+}
+
 static int compare_items(const void *a, const void *b) {
     const Item *x = a, *y = b;
-    if (x->contribution != y->contribution) return x->contribution < y->contribution ? -1 : 1;
+    int c = compare_evaluation(x->contribution, y->contribution);
+    if (c != 0) return c;
     return x->event < y->event ? -1 : x->event > y->event;
 }
 
@@ -724,7 +737,7 @@ UmamiStatus umami_matrix_element(UmamiHandle handle, size_t count, size_t stride
             k++;
         }
     }
-    /* evaluate by contribution (the order of the items within one is the events') */
+    /* evaluate by (process, colour, permutation) (the items in event order within each) */
     Item *sorted = malloc(item_count * sizeof *sorted);
     if (!sorted) { free(items); free(values); return UMAMI_ERROR; }
     memcpy(sorted, items, item_count * sizeof *sorted);
@@ -732,7 +745,8 @@ UmamiStatus umami_matrix_element(UmamiHandle handle, size_t count, size_t stride
     UmamiStatus status = UMAMI_SUCCESS;
     for (size_t first = 0; status == UMAMI_SUCCESS && first < item_count;) {
         size_t last = first;
-        while (last < item_count && sorted[last].contribution == sorted[first].contribution) last++;
+        while (last < item_count && compare_evaluation(sorted[last].contribution, sorted[first].contribution) == 0)
+            last++;
         status = evaluate(instance, sorted + first, last - first, momenta, stride);
         first = last;
     }

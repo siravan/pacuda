@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: 0BSD */
 /* Phase 0: a recording recurrence runner. It exports the runner's three entry points, logs
  * every call as one JSON line to $PACUDA_TRACE (default pacuda-trace.jsonl), and forwards it to
- * the real runner, $PACUDA_REAL_RUNNER.
+ * the real runner, $PACUDA_REAL_RUNNER. PACUDA_TRACE=none: no log (a pass-through that only
+ * configures the runner from PACMAN_RECURRENCE_KERNEL, for the RustiCol hook path).
  *
  * Each line separates what a replay file would have to hold ("static": the words, widths, run
  * lists, table sizes and hashes of the scale, factor and form tables) from what changes with
@@ -43,15 +44,17 @@ static void init(void) {
     int (*configure)(const pacman_recurrence_options *) = dlsym(lib, "pacman_recurrence_v1_configure");
     const char *k = getenv("PACMAN_RECURRENCE_KERNEL");
     if (configure && k && *k) {
-        pacman_recurrence_options o = {PACMAN_RECURRENCE_ABI, sizeof o, PACMAN_RECURRENCE_KERNEL_DF64, 0, 0, 0};
+        const char *st = getenv("PACMAN_RUNNER_STATS");
+        pacman_recurrence_options o = {PACMAN_RECURRENCE_ABI, sizeof o, PACMAN_RECURRENCE_KERNEL_DF64, 0, 0,
+                                       st && !strcmp(st, "1")};
         if (!strcmp(k, "f64")) o.kernel = PACMAN_RECURRENCE_KERNEL_F64;
         else if (!strcmp(k, "mixed")) o.kernel = PACMAN_RECURRENCE_KERNEL_MIXED;
         else if (!strcmp(k, "mixed64")) o.kernel = PACMAN_RECURRENCE_KERNEL_MIXED64;
         if (configure(&o) != 0) abort();
     }
     const char *trace = getenv("PACUDA_TRACE");
-    out = fopen(trace ? trace : "pacuda-trace.jsonl", "a");
-    if (!out || !real_run || !real_reduce || !real_capabilities) abort();
+    out = trace && !strcmp(trace, "none") ? NULL : fopen(trace ? trace : "pacuda-trace.jsonl", "a");
+    if ((!out && !(trace && !strcmp(trace, "none"))) || !real_run || !real_reduce || !real_capabilities) abort();
 }
 
 static uint64_t fnv(uint64_t h, const void *data, size_t bytes) {
@@ -100,6 +103,10 @@ int pacman_recurrence_v1_symjit_kernel(const char *sha256_hex) {
 int pacman_recurrence_v1_run(const pacman_recurrence_call *c) {
     pthread_mutex_lock(&lock);
     init();
+    if (!out) {
+        pthread_mutex_unlock(&lock);
+        return real_run(c);
+    }
     /* the struct may end before the reduction fields or before the forms (struct_size) */
     size_t size = c->struct_size;
     int has_zero = size > offsetof(pacman_recurrence_call, flags);
@@ -155,6 +162,10 @@ int pacman_recurrence_v1_run(const pacman_recurrence_call *c) {
 int pacman_recurrence_v1_reduce(const pacman_recurrence_reduce *r) {
     pthread_mutex_lock(&lock);
     init();
+    if (!out) {
+        pthread_mutex_unlock(&lock);
+        return real_reduce(r);
+    }
     int zero_before = 1;
     for (uint32_t i = 0; i < r->points; i++) zero_before &= r->output[i] == 0.0;
     int status = real_reduce(r);
