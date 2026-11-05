@@ -900,7 +900,7 @@ struct Device {
     // reduction buffers
     uint32_t *rplanes = nullptr;
     double *rweights = nullptr, *routput = nullptr;
-    size_t rcount_capacity = 0, routput_capacity = 0;
+    size_t rcount_capacity = 0, rweights_capacity = 0, routput_capacity = 0;
     // statistics (PACMAN_RUNNER_STATS=1)
     uint64_t calls = 0, points = 0, copies = 0, bytes = 0, reductions = 0;
     double seconds = 0;
@@ -1508,6 +1508,81 @@ __global__ void reduce_kernel(const double *are, const double *aim, size_t ld, c
     output[i] = acc;
 }
 
+// one thread per (point, output): its planes in order, as RustiCol's loop over the amplitudes
+template <class R>
+__global__ void reduce_resolved_kernel(const double *are, const double *aim, size_t ld, const uint32_t *planes,
+                                       const double *weights, const uint32_t *offsets, double *output,
+                                       uint32_t points, size_t output_stride, size_t point_stride) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t o = blockIdx.y;
+    if (i >= points) return;
+    size_t out = o * output_stride + i * point_stride;
+    double acc = output[out];
+    for (uint32_t k = __ldg(offsets + o), end = __ldg(offsets + o + 1); k < end; k++) {
+        size_t at = (size_t)__ldg(planes + k) * ld + i;
+        double re = as_double(ldr<R>(are, at)), im = as_double(ldr<R>(aim, at));
+        acc = __dadd_rn(acc, __dmul_rn(__ldg(weights + k), __fma_rn(re, re, __dmul_rn(im, im))));
+    }
+    output[out] = acc;
+}
+
+// device buffers of at least `n` elements
+template <class T> static bool reserve(T **p, size_t *capacity, size_t n, const char *what) {
+    if (n <= *capacity) return true;
+    if (*p) cudaFree(*p);
+    *p = nullptr;
+    *capacity = 0;
+    if (failed(cudaMalloc((void **)p, n * sizeof(T)), what)) return false;
+    *capacity = n;
+    return true;
+}
+
+static int reduce_resolved_locked(const pacman_recurrence_reduce_resolved *r) {
+    initialize();
+    if (!r || r->abi_version != PACMAN_RECURRENCE_ABI || r->struct_size != sizeof(pacman_recurrence_reduce_resolved) ||
+        !r->offsets || !r->output || r->outputs == 0 || r->outputs > 65535)
+        return PACMAN_RECURRENCE_INVALID;
+    if (!device.kept || r->points != device.kept_points) return PACMAN_RECURRENCE_INVALID;
+    uint32_t count = r->offsets[r->outputs];
+    if (r->offsets[0] != 0 || (count && (!r->planes || !r->weights))) return PACMAN_RECURRENCE_INVALID;
+    for (uint32_t o = 0; o < r->outputs; o++)
+        if (r->offsets[o] > r->offsets[o + 1]) return PACMAN_RECURRENCE_INVALID;
+    for (uint32_t k = 0; k < count; k++)
+        if (r->planes[k] >= device.kept_planes) return PACMAN_RECURRENCE_INVALID;
+    if (r->points == 0) return PACMAN_RECURRENCE_OK;
+    // the output span (all the indices the call writes)
+    size_t span = (size_t)(r->outputs - 1) * r->output_stride + (size_t)(r->points - 1) * r->point_stride + 1;
+    double start = device.stats ? now() : 0;
+    static uint32_t *offsets = nullptr;
+    static size_t offsets_capacity = 0;
+    if (!reserve(&device.rplanes, &device.rcount_capacity, std::max<size_t>(count, 1), "reduction") ||
+        !reserve(&device.rweights, &device.rweights_capacity, std::max<size_t>(count, 1), "reduction") ||
+        !reserve(&offsets, &offsets_capacity, r->outputs + 1, "reduction") ||
+        !reserve(&device.routput, &device.routput_capacity, span, "reduction"))
+        return PACMAN_RECURRENCE_DEVICE_ERROR;
+    if ((count && (failed(cudaMemcpy(device.rplanes, r->planes, count * sizeof(uint32_t), cudaMemcpyHostToDevice), "reduction") ||
+                   failed(cudaMemcpy(device.rweights, r->weights, count * sizeof(double), cudaMemcpyHostToDevice), "reduction"))) ||
+        failed(cudaMemcpy(offsets, r->offsets, (r->outputs + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice), "reduction") ||
+        failed(cudaMemcpy(device.routput, r->output, span * sizeof(double), cudaMemcpyHostToDevice), "reduction"))
+        return PACMAN_RECURRENCE_DEVICE_ERROR;
+    dim3 block(128), grid((r->points + 127) / 128, r->outputs);
+    if (device.kept_df64)
+        reduce_resolved_kernel<D><<<grid, block>>>(device.are, device.aim, device.kept_stride, device.rplanes, device.rweights,
+                                                   offsets, device.routput, r->points, r->output_stride, r->point_stride);
+    else
+        reduce_resolved_kernel<double><<<grid, block>>>(device.are, device.aim, device.kept_stride, device.rplanes,
+                                                        device.rweights, offsets, device.routput, r->points,
+                                                        r->output_stride, r->point_stride);
+    if (failed(cudaGetLastError(), "reduction") ||
+        failed(cudaMemcpy(r->output, device.routput, span * sizeof(double), cudaMemcpyDeviceToHost), "reduction"))
+        return PACMAN_RECURRENCE_DEVICE_ERROR;
+    device.copies += 2;
+    device.bytes += 2 * span * sizeof(double);
+    device.reductions++;
+    if (device.stats) device.seconds += now() - start;
+    return PACMAN_RECURRENCE_OK;
+}
+
 static int reduce_locked(const pacman_recurrence_reduce *r) {
     initialize();
     if (!r || r->abi_version != PACMAN_RECURRENCE_ABI || r->struct_size != sizeof(pacman_recurrence_reduce) ||
@@ -1517,25 +1592,10 @@ static int reduce_locked(const pacman_recurrence_reduce *r) {
     for (uint32_t k = 0; k < r->count; k++)
         if (r->planes[k] >= device.kept_planes) return PACMAN_RECURRENCE_INVALID;
     double start = device.stats ? now() : 0;
-    if (r->count > device.rcount_capacity) {
-        if (device.rplanes) cudaFree(device.rplanes);
-        if (device.rweights) cudaFree(device.rweights);
-        device.rplanes = nullptr;
-        device.rweights = nullptr;
-        device.rcount_capacity = 0;
-        if (failed(cudaMalloc((void **)&device.rplanes, r->count * sizeof(uint32_t)), "reduction") ||
-            failed(cudaMalloc((void **)&device.rweights, r->count * sizeof(double)), "reduction"))
-            return PACMAN_RECURRENCE_DEVICE_ERROR;
-        device.rcount_capacity = r->count;
-    }
-    if (r->points > device.routput_capacity) {
-        if (device.routput) cudaFree(device.routput);
-        device.routput = nullptr;
-        device.routput_capacity = 0;
-        if (failed(cudaMalloc((void **)&device.routput, r->points * sizeof(double)), "reduction"))
-            return PACMAN_RECURRENCE_DEVICE_ERROR;
-        device.routput_capacity = r->points;
-    }
+    if (!reserve(&device.rplanes, &device.rcount_capacity, std::max<uint32_t>(r->count, 1), "reduction") ||
+        !reserve(&device.rweights, &device.rweights_capacity, std::max<uint32_t>(r->count, 1), "reduction") ||
+        !reserve(&device.routput, &device.routput_capacity, std::max<uint32_t>(r->points, 1), "reduction"))
+        return PACMAN_RECURRENCE_DEVICE_ERROR;
     size_t bytes = r->points * sizeof(double);
     if ((r->count && (failed(cudaMemcpy(device.rplanes, r->planes, r->count * sizeof(uint32_t),
                                         cudaMemcpyHostToDevice), "reduction") ||
@@ -1665,6 +1725,13 @@ extern "C" int pacman_recurrence_v1_test_sources(const uint32_t *codes, const do
     cudaFree(dc); cudaFree(dm); cudaFree(dp); cudaFree(dre); cudaFree(dim);
     release_runner_lock();
     return ok ? PACMAN_RECURRENCE_OK : PACMAN_RECURRENCE_DEVICE_ERROR;
+}
+
+extern "C" int pacman_recurrence_v1_reduce_resolved(const pacman_recurrence_reduce_resolved *r) {
+    acquire_runner_lock();
+    int status = reduce_resolved_locked(r);
+    release_runner_lock();
+    return status;
 }
 
 extern "C" int pacman_recurrence_v1_reduce(const pacman_recurrence_reduce *r) {

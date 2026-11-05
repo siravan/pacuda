@@ -2,7 +2,7 @@
 //! pacuda-convert: records the recurrence plan runs of a pyAmpliCol LC artifact, as an mg7 UMAMI
 //! library evaluates them, with the record mode of the patched RustiCol (no GPU needed).
 //!
-//!   pacuda-convert record LC_DIR [-n POINTS] [--replay librecurrence.so [--kernel K]]
+//!   pacuda-convert record LC_DIR [-n POINTS] [--replay librecurrence.so [--kernel K] [--host-reduce]]
 //!
 //! `record`: for each (process, colour id) the artifact's UMAMI provider (`API/umami/provider_p0.h`)
 //! uses, one resolved evaluation of POINTS random points (default 64) under recording, then a
@@ -136,12 +136,13 @@ fn main() {
     let result = (|| -> Result<()> {
         let command = args.first().ok_or_else(|| anyhow!("usage: pacuda-convert record LC_DIR [-n POINTS]"))?;
         let (mut paths, mut points) = (Vec::<PathBuf>::new(), 64usize);
-        let (mut runner_path, mut kernel) = (None::<PathBuf>, 1u32);
+        let (mut runner_path, mut kernel, mut host_reduce) = (None::<PathBuf>, 1u32, false);
         let mut it = args[1..].iter();
         while let Some(a) = it.next() {
             match a.as_str() {
                 "-n" => points = it.next().ok_or_else(|| anyhow!("-n needs a value"))?.parse()?,
                 "--replay" => runner_path = it.next().map(PathBuf::from),
+                "--host-reduce" => host_reduce = true,
                 "--kernel" => {
                     kernel = match it.next().map(String::as_str) {
                         Some("df64") => 0,
@@ -165,15 +166,29 @@ fn main() {
                     let mut problems = check(&r, points);
                     let mut compared = String::new();
                     if let (Some(runner), true) = (&runner, problems.is_empty()) {
-                        match replay::replay(runner, &r) {
+                        match replay::replay(runner, &r, host_reduce) {
                             Ok(values) => {
                                 let differ = values.iter().zip(&r.values).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
-                                let worst = values
-                                    .iter()
-                                    .zip(&r.values)
-                                    .map(|(a, b)| if *b != 0.0 { (a / b - 1.0).abs() } else { a.abs() })
-                                    .fold(0.0f64, f64::max);
-                                compared = format!(", replay: {differ} of {} values differ (max rel {worst:.1e})", values.len());
+                                // the error relative to the point's matrix element (the sum over helicities):
+                                // a helicity value can be a cancellation residue near zero
+                                let h = r.helicity_count.max(1);
+                                let mut worst = 0.0f64;
+                                let mut worst_total = 0.0f64;
+                                for (a, b) in values.chunks(h).zip(r.values.chunks(h)) {
+                                    let scale: f64 = b.iter().map(|v| v.abs()).sum();
+                                    if scale == 0.0 {
+                                        continue;
+                                    }
+                                    for (x, y) in a.iter().zip(b) {
+                                        worst = worst.max((x - y).abs() / scale);
+                                    }
+                                    let (ta, tb): (f64, f64) = (a.iter().sum(), b.iter().sum());
+                                    worst_total = worst_total.max((ta / tb - 1.0).abs());
+                                }
+                                compared = format!(
+                                    ", replay: {differ} of {} values differ (max {worst:.1e} of the point's total; total max rel {worst_total:.1e})",
+                                    values.len()
+                                );
                                 if kernel == 1 && differ > 0 {
                                     problems.push("the f64 replay is not bit-identical".into());
                                 }

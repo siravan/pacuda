@@ -158,6 +158,36 @@ int main(int argc, char **argv) {
             fprintf(stderr, "reduction, point %d: %.17g for %.17g\n", i, got[i], want[i]);
             return 1;
         }
+    /* the resolved reduction: a kept run reduced into 3 outputs ([point][output], output 1 empty,
+     * plane 0 in both others), as the host reduces each output's planes in order */
+    int (*reduce_resolved)(const pacman_recurrence_reduce_resolved *) =
+        (int (*)(const pacman_recurrence_reduce_resolved *))dlsym(lib, "pacman_recurrence_v1_reduce_resolved");
+    if (!reduce_resolved) { fprintf(stderr, "no pacman_recurrence_v1_reduce_resolved\n"); return 1; }
+    {
+        enum { OUTS = 3 };
+        uint32_t rplanes[5] = {2, 0, 0, 1, 0};
+        double rweights[5] = {0.75, 1.5, 2.0, -0.25, 0.5};
+        uint32_t offsets[OUTS + 1] = {0, 2, 2, 5};
+        static double rwant[POINTS * OUTS], rgot[POINTS * OUTS];
+        for (int i = 0; i < POINTS; i++)
+            for (int o = 0; o < OUTS; o++) {
+                double v = 0.25 * i - o;
+                for (uint32_t k = offsets[o]; k < offsets[o + 1]; k++) {
+                    double re = are[rplanes[k] * STRIDE + i], im = aim[rplanes[k] * STRIDE + i];
+                    v += rweights[k] * fma(re, re, im * im);
+                }
+                rwant[i * OUTS + o] = v;
+                rgot[i * OUTS + o] = 0.25 * i - o;
+            }
+        if (run(&k2) != 0) return 1;
+        pacman_recurrence_reduce_resolved rr = {1, sizeof rr, rplanes, rweights, offsets, rgot, OUTS, POINTS, 1, OUTS};
+        if (reduce_resolved(&rr) != 0) { fprintf(stderr, "reduce_resolved failed\n"); return 1; }
+        for (int j = 0; j < POINTS * OUTS; j++)
+            if (memcmp(&rwant[j], &rgot[j], 8)) {
+                fprintf(stderr, "resolved reduction, value %d: %.17g for %.17g\n", j, rgot[j], rwant[j]);
+                return 1;
+            }
+    }
     for (int p = 0; p < AP; p++)
         for (int i = 0; i < POINTS; i++) printf("%.17g %.17g\n", are[p * STRIDE + i], aim[p * STRIDE + i]);
     return 0;

@@ -73,7 +73,24 @@ enum {
     PACMAN_RECURRENCE_DEVICE_ERROR = 3,
 };
 
+// After a run with PACMAN_RECURRENCE_KEEP_AMPLITUDES: several outputs in one call. For output
+// o < outputs and point i < points,
+//   output[o * output_stride + i * point_stride] += weights[k] * fma(re, re, im * im)
+// for k = offsets[o] .. offsets[o+1]-1 in order, (re, im) the run's amplitude plane planes[k] at
+// point i: RustiCol's resolved LC reduction (one output per helicity; `[point][helicity]` is
+// output_stride 1, point_stride the helicity count). One call reduces a kept run (it ends it).
+typedef struct {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    const uint32_t *planes;
+    const double *weights;
+    const uint32_t *offsets;  // outputs + 1 entries
+    double *output;
+    uint32_t outputs, points, output_stride, point_stride;
+} pacman_recurrence_reduce_resolved;
+
 int pacman_recurrence_v1_run(const pacman_recurrence_call *call);
+int pacman_recurrence_v1_reduce_resolved(const pacman_recurrence_reduce_resolved *reduce);
 int pacman_recurrence_v1_reduce(const pacman_recurrence_reduce *reduce);
 // bit 0: op 12 (sources on the device); bit 1: PACMAN_RECURRENCE_FORMS_ON_DEVICE
 #define PACMAN_RECURRENCE_CAP_SOURCES 1u

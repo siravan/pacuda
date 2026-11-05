@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: 0BSD
 //! Replays a recording on a recurrence runner (`librecurrence.so`) and compares the values with the
 //! CPU's: the check that a recording holds everything an evaluation needs. Each recorded run is
-//! one runner call (its symjit kernel indices mapped to the runner's); its downloaded amplitudes
-//! are reduced on the host in the recorded order (`accumulate_lc_diagonal_amplitude`), then the
-//! process-group factor is applied (`apply_process_group_factor`).
+//! one runner call (its symjit kernel indices mapped to the runner's) that keeps its amplitudes on
+//! the device, reduced there into every helicity output by one `reduce_resolved` call (each
+//! output's planes in the recorded order); or, with `host_reduce`, copied back and reduced on the
+//! host as RustiCol does (`accumulate_lc_diagonal_amplitude`). Then the process-group factor is
+//! applied (`apply_process_group_factor`).
 
 use anyhow::{anyhow, bail, Result};
 
@@ -53,6 +55,37 @@ struct RunnerCall {
     term_coefficients: *const f64,
 }
 
+/// `pacman_recurrence_reduce_resolved`.
+#[repr(C)]
+struct ReduceResolved {
+    abi_version: u32,
+    struct_size: u32,
+    planes: *const u32,
+    weights: *const f64,
+    offsets: *const u32,
+    output: *mut f64,
+    outputs: u32,
+    points: u32,
+    output_stride: u32,
+    point_stride: u32,
+}
+
+/// The reductions of a run grouped by helicity output, each output's in recorded order:
+/// (planes, weights, offsets[outputs + 1]).
+pub fn group_reductions(run: &rusticol_core::recurrence::direct_backend::PacmanRecordedRun, outputs: usize) -> (Vec<u32>, Vec<f64>, Vec<u32>) {
+    let mut planes = Vec::with_capacity(run.reductions.len());
+    let mut weights = Vec::with_capacity(run.reductions.len());
+    let mut offsets = vec![0u32];
+    for h in 0..outputs as u32 {
+        for red in run.reductions.iter().filter(|red| red.helicity == h) {
+            planes.push(red.plane);
+            weights.push(red.weight);
+        }
+        offsets.push(planes.len() as u32);
+    }
+    (planes, weights, offsets)
+}
+
 /// `pacman_recurrence_options`.
 #[repr(C)]
 struct Options {
@@ -64,10 +97,12 @@ struct Options {
     stats: u32,
 }
 
+const KEEP_AMPLITUDES: u32 = 1;
 const FORMS_ON_DEVICE: u32 = 2;
 
 pub struct Runner {
     run: unsafe extern "C" fn(*const RunnerCall) -> i32,
+    reduce_resolved: unsafe extern "C" fn(*const ReduceResolved) -> i32,
     symjit_kernel: unsafe extern "C" fn(*const std::ffi::c_char) -> i32,
     _library: libloading::Library,
 }
@@ -83,6 +118,7 @@ impl Runner {
                 .map_err(|e| anyhow!("{}: {}", path.display(), e))
         };
         let run = get(b"pacman_recurrence_v1_run\0")?;
+        let reduce_resolved = get(b"pacman_recurrence_v1_reduce_resolved\0")?;
         let configure = get(b"pacman_recurrence_v1_configure\0")?;
         let symjit_kernel = get(b"pacman_recurrence_v1_symjit_kernel\0")?;
         let configure: unsafe extern "C" fn(*const Options) -> i32 = unsafe { std::mem::transmute(configure) };
@@ -92,6 +128,7 @@ impl Runner {
         }
         Ok(Runner {
             run: unsafe { std::mem::transmute(run) },
+            reduce_resolved: unsafe { std::mem::transmute(reduce_resolved) },
             symjit_kernel: unsafe { std::mem::transmute(symjit_kernel) },
             _library: library,
         })
@@ -125,7 +162,7 @@ pub fn remap_kernels(words: &[u64], map: &[u32]) -> Result<Vec<u64>> {
 }
 
 /// The values of `r` replayed on `runner` (layout `[point][helicity]`).
-pub fn replay(runner: &Runner, r: &Recorded) -> Result<Vec<f64>> {
+pub fn replay(runner: &Runner, r: &Recorded, host_reduce: bool) -> Result<Vec<f64>> {
     let rec = &r.recording;
     let map: Vec<u32> = rec.symjit_sha256.iter().map(|s| runner.kernel_index(s)).collect::<Result<_>>()?;
     let (n, h) = (r.external_count, r.helicity_count);
@@ -186,7 +223,7 @@ pub fn replay(runner: &Runner, r: &Recorded) -> Result<Vec<f64>> {
             points: run.points,
             zero_amplitude: run.zero_amplitude.as_ptr(),
             zero_amplitude_runs: (run.zero_amplitude.len() / 2) as u32,
-            flags: FORMS_ON_DEVICE,
+            flags: FORMS_ON_DEVICE | if host_reduce { 0 } else { KEEP_AMPLITUDES },
             external_momenta: external.as_ptr(),
             external_count: n as u32,
             term_count: run.term_slots.len() as u32,
@@ -199,11 +236,32 @@ pub fn replay(runner: &Runner, r: &Recorded) -> Result<Vec<f64>> {
         if status != 0 {
             bail!("run {k}: the runner returned {status}");
         }
-        for red in &run.reductions {
-            let plane = red.plane as usize * stride;
-            for p in 0..points {
-                let (re, im) = (amplitude_re[plane + p], amplitude_im[plane + p]);
-                values[(tile_start + p) * h + red.helicity as usize] += red.weight * re.mul_add(re, im * im);
+        if host_reduce {
+            for red in &run.reductions {
+                let plane = red.plane as usize * stride;
+                for p in 0..points {
+                    let (re, im) = (amplitude_re[plane + p], amplitude_im[plane + p]);
+                    values[(tile_start + p) * h + red.helicity as usize] += red.weight * re.mul_add(re, im * im);
+                }
+            }
+        } else {
+            let (planes, weights, offsets) = group_reductions(run, h);
+            let reduce = ReduceResolved {
+                abi_version: 1,
+                struct_size: size_of::<ReduceResolved>() as u32,
+                planes: planes.as_ptr(),
+                weights: weights.as_ptr(),
+                offsets: offsets.as_ptr(),
+                output: values[tile_start * h..].as_mut_ptr(),
+                outputs: h as u32,
+                points: run.points,
+                output_stride: 1,
+                point_stride: h as u32,
+            };
+            // SAFETY: the tables live during the call; the output covers the tile's points
+            let status = unsafe { (runner.reduce_resolved)(&reduce) };
+            if status != 0 {
+                bail!("run {k}: the resolved reduction returned {status}");
             }
         }
         tile_start += points;
