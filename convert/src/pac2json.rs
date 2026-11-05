@@ -2,12 +2,15 @@
 //! pac2json: a human-readable copy of a pyAmpliCol LC artifact's recurrence programs, recorded as
 //! `pacuda-convert` records them (the patched RustiCol's record mode, no GPU needed).
 //!
-//!   pac2json LC_DIR -o OUT_DIR [--parameters FILE.json] [-n POINTS] [-e EXAMPLES]
+//!   pac2json LC_DIR -o OUT_DIR [--parameters FILE.json] [-n POINTS] [-e EXAMPLES] [--sjb2obj PATH]
 //!   pac2json pack OUT_DIR -o FILE.pacuda [--kernel K] [--batch N]
 //!
 //! The first form writes OUT_DIR/main.json (the programs), OUT_DIR/examples.json (EXAMPLES
 //! reference points per program, default 8: momenta and the CPU's outputs) and OUT_DIR/kernels/
-//! (the symjit kernels the programs call, `<sha256>.plane.symjit`), then reads both JSON files back
+//! (the symjit kernels the programs call, `<sha256>.plane.symjit`, and each one's shared library
+//! `<sha256>.so` with its C header `<sha256>.h`: compiled by symjit-utils' `sjb2obj`, PATH or
+//! `sjb2obj` on the PATH, and linked by `cc -shared`; skipped with a warning when `sjb2obj` is not
+//! found and `--sjb2obj` is not given), then reads both JSON files back
 //! and checks that they rebuild the recording (`pack`'s reconstruction). `--parameters` and `-n`:
 //! as for `pacuda-convert convert`.
 //! `pack`: the `.pacuda` file of a pac2json folder (for `pacuda-convert check` on a runner).
@@ -1335,7 +1338,70 @@ fn canonical_file(file: &File) -> Result<File> {
 
 // ---- the kernels -------------------------------------------------------------------------------
 
-fn kernels_json(lc: &Path, file: &File, dir: &Path) -> Result<J> {
+/// How to build each kernel's shared library: the `sjb2obj` binary, and whether it was asked for
+/// (then a failure to run it is an error; else the libraries are skipped when it is missing).
+struct Libraries {
+    sjb2obj: PathBuf,
+    required: bool,
+}
+
+/// `kernels/<sha>.so` (and its C header `<sha>.h`) of kernel `name`: `sjb2obj` compiles the plane
+/// application into an object file, `cc -shared` links it. None when `sjb2obj` is missing and was
+/// not asked for.
+fn build_library(dir: &Path, sha: &str, name: &str, libraries: &Libraries) -> Result<Option<J>> {
+    let (plane, object, header, library) =
+        (dir.join(format!("{sha}.plane.symjit")), dir.join(format!("{sha}.o")), dir.join(format!("{sha}.h")), dir.join(format!("{sha}.so")));
+    let run = |command: &mut std::process::Command, what: &str| -> Result<Option<()>> {
+        match command.output() {
+            Ok(out) if out.status.success() => Ok(Some(())),
+            Ok(out) => bail!("{what}: {}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && what == "sjb2obj" && !libraries.required => Ok(None),
+            Err(e) => bail!("{what}: {e}"),
+        }
+    };
+    let compiled = run(
+        std::process::Command::new(&libraries.sjb2obj).arg(&plane).arg("-o").arg(&object).arg("--name").arg(name).arg("--header").arg(&header),
+        "sjb2obj",
+    )
+    .with_context(|| format!("{}: compiling {}", libraries.sjb2obj.display(), plane.display()))?;
+    if compiled.is_none() {
+        return Ok(None);
+    }
+    run(std::process::Command::new("cc").arg("-shared").arg("-o").arg(&library).arg(&object), "cc")
+        .with_context(|| format!("linking {}", library.display()))?;
+    std::fs::remove_file(&object)?;
+    // the shape and the target, from the header
+    let text = std::fs::read_to_string(&header)?;
+    let define = |what: &str| -> Result<i64> {
+        let key = format!("#define {}_{what} ", name.to_uppercase());
+        text.lines()
+            .find_map(|l| l.strip_prefix(&key))
+            .and_then(|v| v.trim().parse().ok())
+            .ok_or_else(|| anyhow!("{}: no {key}", header.display()))
+    };
+    let target = text.lines().next().and_then(|l| Some(l.split_once('(')?.1.split_once(')')?.0.to_string())).unwrap_or_default();
+    Ok(Some(o(vec![
+        ("path", s(format!("kernels/{sha}.so"))),
+        ("header", s(format!("kernels/{sha}.h"))),
+        ("symbol", s(name)),
+        ("target", s(target)),
+        ("states", u(define("COUNT_STATES")?)),
+        ("outputs", u(define("COUNT_OBS")?)),
+        ("params", u(define("COUNT_PARAMS")?)),
+        ("mem", u(define("MEM_SIZE")?)),
+        (
+            "call",
+            s(format!(
+                "int {name}(double *mem, const symjit_slice *states, size_t idx, const double *params), symjit_slice = {{double *ptr; size_t len}}: \
+                 states = the input planes (the binding's inputs, in order) then the output planes (re, im of each output pair); \
+                 {name}(NULL, states, i, params) reads point i of each input plane and writes point i of each output plane; 0 on success. \
+                 See the header"
+            )),
+        ),
+    ])))
+}
+
+fn kernels_json(lc: &Path, file: &File, dir: &Path, libraries: &Libraries) -> Result<J> {
     record::extract_kernels(lc, &file.symjit_sha256, dir)?;
     let pack = rusticol_core::pacbin::PacbinReader::open(lc.join("evaluators.pacbin")).map_err(|e| anyhow!("{}: {e}", lc.display()))?;
     let mut members: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -1364,9 +1430,21 @@ fn kernels_json(lc: &Path, file: &File, dir: &Path) -> Result<J> {
         }
     }
     let mut out = Vec::new();
+    let mut missing = false;
     for (k, sha) in file.symjit_sha256.iter().enumerate() {
         let bytes = std::fs::metadata(dir.join(format!("{sha}.plane.symjit")))?.len();
         let (inputs, pairs) = shape.get(&(k as u32)).copied().unwrap_or((0, 0));
+        let library = if missing { None } else { build_library(dir, sha, &format!("k{k}"), libraries)? };
+        if let Some(J::O(m)) = &library {
+            let get = |key: &str| m.iter().find(|(n, _)| n == key).and_then(|(_, v)| if let J::I(x) = v { Some(*x) } else { None });
+            if get("states") != Some(inputs as i64) || get("outputs") != Some(2 * pairs as i64) || get("params") != Some(0) {
+                bail!("kernel k{k}: the library's shape ({:?} states, {:?} outputs, {:?} params) is not the binding's ({inputs} inputs, {pairs} output pairs)", get("states"), get("outputs"), get("params"));
+            }
+        }
+        if library.is_none() && !missing {
+            missing = true;
+            eprintln!("pac2json: no {} found: the kernels' shared libraries are not built (give --sjb2obj PATH)", libraries.sjb2obj.display());
+        }
         out.push(o(vec![
             ("name", s(format!("k{k}"))),
             ("sha256", s(sha.clone())),
@@ -1376,6 +1454,7 @@ fn kernels_json(lc: &Path, file: &File, dir: &Path) -> Result<J> {
             ("inputs", u(inputs as i64)),
             ("output_pairs", u(pairs as i64)),
             ("rows", u(*uses.get(&(k as u32)).unwrap_or(&0) as i64)),
+            ("library", library.unwrap_or(J::Null)),
             (
                 "format",
                 s("a symjit plane application (.plane.symjit: the MIR of one executor row, f64); inputs and outputs as the bindings \
@@ -1411,10 +1490,10 @@ fn info_of(lc: &Path, file: &File, parameters: &[(String, f64)]) -> Result<Info>
     Ok(info)
 }
 
-fn convert(lc: &Path, out: &Path, parameters: &[(String, f64)], points: usize, examples: usize) -> Result<()> {
+fn convert(lc: &Path, out: &Path, parameters: &[(String, f64)], points: usize, examples: usize, libraries: &Libraries) -> Result<()> {
     let (file, helicity_ids) = record::convert_artifact(lc, points, parameters, 0, 0, examples)?;
     std::fs::create_dir_all(out.join("kernels")).with_context(|| out.display().to_string())?;
-    let kernels = kernels_json(lc, &file, &out.join("kernels"))?;
+    let kernels = kernels_json(lc, &file, &out.join("kernels"), libraries)?;
     let info = info_of(lc, &file, parameters)?;
     let shared = file.processes.windows(2).all(|w| w[0].parameters == w[1].parameters);
     let mut programs = Vec::new();
@@ -1475,6 +1554,7 @@ fn main() {
         let mut paths = Vec::<PathBuf>::new();
         let (mut out, mut parameters, mut points, mut examples) = (None::<PathBuf>, Vec::new(), 1000usize, 8usize);
         let (mut kernel, mut batch) = (0u32, 0u32);
+        let mut sjb2obj: Option<PathBuf> = None;
         let mut it = args.iter();
         while let Some(a) = it.next() {
             let mut value = || it.next().ok_or_else(|| anyhow!("{a} needs a value"));
@@ -1489,6 +1569,7 @@ fn main() {
                 }
                 "--kernel" => kernel = record::kernel_number(Some(value()?))?,
                 "--batch" => batch = value()?.parse()?,
+                "--sjb2obj" => sjb2obj = Some(PathBuf::from(value()?)),
                 _ => paths.push(PathBuf::from(a)),
             }
         }
@@ -1504,7 +1585,8 @@ fn main() {
         if examples > points {
             bail!("-e {examples}: at most the recorded points (-n {points})");
         }
-        convert(lc, &out, &parameters, points, examples)
+        let libraries = Libraries { required: sjb2obj.is_some(), sjb2obj: sjb2obj.unwrap_or_else(|| PathBuf::from("sjb2obj")) };
+        convert(lc, &out, &parameters, points, examples, &libraries)
     })();
     if let Err(e) = result {
         eprintln!("pac2json: {e:#}");
