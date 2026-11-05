@@ -1552,6 +1552,7 @@ static int reduce_resolved_locked(const pacman_recurrence_reduce_resolved *r) {
     if (r->points == 0) return PACMAN_RECURRENCE_OK;
     // the output span (all the indices the call writes)
     size_t span = (size_t)(r->outputs - 1) * r->output_stride + (size_t)(r->points - 1) * r->point_stride + 1;
+    bool zero = r->flags & PACMAN_RECURRENCE_OUTPUT_ZERO;
     double start = device.stats ? now() : 0;
     static uint32_t *offsets = nullptr;
     static size_t offsets_capacity = 0;
@@ -1563,7 +1564,8 @@ static int reduce_resolved_locked(const pacman_recurrence_reduce_resolved *r) {
     if ((count && (failed(cudaMemcpy(device.rplanes, r->planes, count * sizeof(uint32_t), cudaMemcpyHostToDevice), "reduction") ||
                    failed(cudaMemcpy(device.rweights, r->weights, count * sizeof(double), cudaMemcpyHostToDevice), "reduction"))) ||
         failed(cudaMemcpy(offsets, r->offsets, (r->outputs + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice), "reduction") ||
-        failed(cudaMemcpy(device.routput, r->output, span * sizeof(double), cudaMemcpyHostToDevice), "reduction"))
+        (zero ? failed(cudaMemset(device.routput, 0, span * sizeof(double)), "reduction")
+              : failed(cudaMemcpy(device.routput, r->output, span * sizeof(double), cudaMemcpyHostToDevice), "reduction")))
         return PACMAN_RECURRENCE_DEVICE_ERROR;
     dim3 block(128), grid((r->points + 127) / 128, r->outputs);
     if (device.kept_df64)
@@ -1576,8 +1578,8 @@ static int reduce_resolved_locked(const pacman_recurrence_reduce_resolved *r) {
     if (failed(cudaGetLastError(), "reduction") ||
         failed(cudaMemcpy(r->output, device.routput, span * sizeof(double), cudaMemcpyDeviceToHost), "reduction"))
         return PACMAN_RECURRENCE_DEVICE_ERROR;
-    device.copies += 2;
-    device.bytes += 2 * span * sizeof(double);
+    device.copies += zero ? 1 : 2;
+    device.bytes += (zero ? 1 : 2) * span * sizeof(double);
     device.reductions++;
     if (device.stats) device.seconds += now() - start;
     return PACMAN_RECURRENCE_OK;
@@ -1729,6 +1731,16 @@ extern "C" int pacman_recurrence_v1_test_sources(const uint32_t *codes, const do
     cudaFree(dc); cudaFree(dm); cudaFree(dp); cudaFree(dre); cudaFree(dim);
     release_runner_lock();
     return ok ? PACMAN_RECURRENCE_OK : PACMAN_RECURRENCE_DEVICE_ERROR;
+}
+
+extern "C" void *pacman_recurrence_v1_host_alloc(size_t bytes) {
+    void *p = nullptr;
+    if (cudaMallocHost(&p, bytes ? bytes : 1) != cudaSuccess) return nullptr;
+    return p;
+}
+
+extern "C" void pacman_recurrence_v1_host_free(void *p) {
+    if (p) cudaFreeHost(p);
 }
 
 extern "C" int pacman_recurrence_v1_reduce_resolved(const pacman_recurrence_reduce_resolved *r) {

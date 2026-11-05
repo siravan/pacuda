@@ -180,11 +180,30 @@ int main(int argc, char **argv) {
                 rgot[i * OUTS + o] = 0.25 * i - o;
             }
         if (run(&k2) != 0) return 1;
-        pacman_recurrence_reduce_resolved rr = {1, sizeof rr, rplanes, rweights, offsets, rgot, OUTS, POINTS, 1, OUTS};
+        pacman_recurrence_reduce_resolved rr = {1, sizeof rr, rplanes, rweights, offsets, rgot, OUTS, POINTS, 1, OUTS, 0};
         if (reduce_resolved(&rr) != 0) { fprintf(stderr, "reduce_resolved failed\n"); return 1; }
         for (int j = 0; j < POINTS * OUTS; j++)
             if (memcmp(&rwant[j], &rgot[j], 8)) {
                 fprintf(stderr, "resolved reduction, value %d: %.17g for %.17g\n", j, rgot[j], rwant[j]);
+                return 1;
+            }
+        /* again from zero (PACMAN_RECURRENCE_OUTPUT_ZERO): what is in the output is not read */
+        for (int i = 0; i < POINTS; i++)
+            for (int o = 0; o < OUTS; o++) {
+                double v = 0.0;
+                for (uint32_t k = offsets[o]; k < offsets[o + 1]; k++) {
+                    double re = are[rplanes[k] * STRIDE + i], im = aim[rplanes[k] * STRIDE + i];
+                    v += rweights[k] * fma(re, re, im * im);
+                }
+                rwant[i * OUTS + o] = v;
+                rgot[i * OUTS + o] = 1e300;
+            }
+        if (run(&k2) != 0) return 1;
+        rr.flags = PACMAN_RECURRENCE_OUTPUT_ZERO;
+        if (reduce_resolved(&rr) != 0) { fprintf(stderr, "reduce_resolved (zero) failed\n"); return 1; }
+        for (int j = 0; j < POINTS * OUTS; j++)
+            if (memcmp(&rwant[j], &rgot[j], 8)) {
+                fprintf(stderr, "resolved reduction from zero, value %d: %.17g for %.17g\n", j, rgot[j], rwant[j]);
                 return 1;
             }
     }

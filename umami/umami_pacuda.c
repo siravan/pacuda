@@ -66,6 +66,9 @@ typedef struct {
     uint32_t outputs;
     uint32_t *offsets, *planes;
     double *weights;
+    /* the helicity outputs with planes (the others are zero): their count, helicities, offsets */
+    uint32_t live;
+    uint32_t *live_helicity, *live_offsets;
     uint32_t reference_points;
     double *reference_momenta, *reference_values;
 } PColour;
@@ -133,6 +136,7 @@ static void free_file(PFile *f) {
             free(c->id); free(c->words); free(c->scale_re); free(c->scale_im); free(c->factor_re);
             free(c->factor_im); free(c->zero); free(c->download); free(c->form_terms); free(c->term_slots);
             free(c->term_coefficients); free(c->offsets); free(c->planes); free(c->weights);
+            free(c->live_helicity); free(c->live_offsets);
             free(c->reference_momenta); free(c->reference_values);
         }
         for (uint32_t k = 0; p->parameter_names && k < p->parameter_count; k++) free(p->parameter_names[k]);
@@ -251,6 +255,17 @@ static PFile *read_file(const char *path) {
                 r.bad = 1;
             for (uint32_t h = 0; !r.bad && h < c->outputs; h++)
                 if (c->offsets[h] > c->offsets[h + 1]) r.bad = 1;
+            /* the outputs with planes, in order (their planes are contiguous: offsets of the
+             * empty ones do not move) */
+            c->live_helicity = r.bad ? NULL : calloc(c->outputs + 1, sizeof(uint32_t));
+            c->live_offsets = r.bad ? NULL : calloc(c->outputs + 2, sizeof(uint32_t));
+            if (!r.bad && (!c->live_helicity || !c->live_offsets)) r.bad = 1;
+            for (uint32_t h = 0; !r.bad && h < c->outputs; h++)
+                if (c->offsets[h + 1] > c->offsets[h]) {
+                    c->live_offsets[c->live] = c->offsets[h];
+                    c->live_helicity[c->live++] = h;
+                }
+            if (!r.bad) c->live_offsets[c->live] = c->offsets[c->outputs];
         }
     }
     if (!r.bad && r.p != r.end) r.bad = 1;
@@ -293,14 +308,30 @@ static uint64_t program_key(const PColour *c) {
 
 /* ---- the instance ---------------------------------------------------------------------------- */
 
+/* Pinned host buffers (the runner's allocation; faster copies). */
+typedef struct {
+    double *p;
+    size_t capacity;
+} Pinned;
+
+static int grow_pinned(Pinned *b, size_t n) {
+    if (n <= b->capacity) return 1;
+    pacman_recurrence_v1_host_free(b->p);
+    b->p = pacman_recurrence_v1_host_alloc(n * sizeof(double));
+    b->capacity = b->p ? n : 0;
+    return b->p != NULL;
+}
+
 typedef struct {
     PFile *file;
     /* per provider process: its file process; per provider process, its current alpha_s */
     PProcess **process;
     double *alpha_s;
-    /* host buffers of the runner calls and the reductions */
-    double *external, *values, *arena;
-    size_t external_capacity, values_capacity, arena_capacity;
+    /* host buffers of the runner calls and the reductions (the momenta and the reduction's output
+     * pinned) */
+    Pinned external, values;
+    double *arena;
+    size_t arena_capacity;
 } Instance;
 
 /* One evaluation: an event's contribution. */
@@ -401,7 +432,9 @@ UmamiStatus umami_free(UmamiHandle handle) {
     Instance *instance = handle;
     free_file(instance->file);
     free(instance->process); free(instance->alpha_s);
-    free(instance->external); free(instance->values); free(instance->arena);
+    pacman_recurrence_v1_host_free(instance->external.p);
+    pacman_recurrence_v1_host_free(instance->values.p);
+    free(instance->arena);
     free(instance);
     return UMAMI_SUCCESS;
 }
@@ -572,8 +605,8 @@ static UmamiStatus evaluate(Instance *instance, Item *items, size_t count, doubl
     size_t n = p->legs, h = p->helicities;
     size_t tile = instance->file->batch ? instance->file->batch : c->tile;
     size_t planes = (size_t)c->current_planes * 2 + (size_t)c->amplitude_planes * 2 + c->momentum_planes;
-    if (!grow(&instance->external, &instance->external_capacity, n * 4 * tile) ||
-        !grow(&instance->values, &instance->values_capacity, h * tile) ||
+    size_t live = c->live;
+    if (!grow_pinned(&instance->external, n * 4 * tile) || !grow_pinned(&instance->values, (live ? live : 1) * tile) ||
         !grow(&instance->arena, &instance->arena_capacity, planes * tile + 1))
         return UMAMI_ERROR;
     double *current_re = instance->arena, *current_im = current_re + (size_t)c->current_planes * tile;
@@ -584,7 +617,7 @@ static UmamiStatus evaluate(Instance *instance, Item *items, size_t count, doubl
         size_t points = count - start < tile ? count - start : tile;
         /* runtime input leg j = UMAMI leg permutation[j]; external leg l = sign * input leg
          * crossing[l]; source-major planes of `points` values */
-        double *external = instance->external;
+        double *external = instance->external.p;
         for (size_t l = 0; l < n; l++) {
             size_t source = p->crossing_leg ? p->crossing_leg[l] : l;
             double sign = p->crossing_leg ? p->crossing_sign[l] : 1.0;
@@ -637,23 +670,35 @@ static UmamiStatus evaluate(Instance *instance, Item *items, size_t count, doubl
             fprintf(stderr, "pacuda: process %s, colour %s: the runner failed\n", p->key, c->id);
             return UMAMI_ERROR;
         }
-        double *values = instance->values;
-        memset(values, 0, points * h * sizeof(double));
-        pacman_recurrence_reduce_resolved reduce = {PACMAN_RECURRENCE_ABI, sizeof reduce, c->planes, c->weights,
-                                                    c->offsets, values, (uint32_t)h, (uint32_t)points, 1, (uint32_t)h};
-        if (pacman_recurrence_v1_reduce_resolved(&reduce) != PACMAN_RECURRENCE_OK) {
-            fprintf(stderr, "pacuda: process %s, colour %s: the reduction failed\n", p->key, c->id);
-            return UMAMI_ERROR;
+        /* the outputs with planes only ([point][live]), from zero on the device */
+        double *values = instance->values.p;
+        if (live) {
+            pacman_recurrence_reduce_resolved reduce = {PACMAN_RECURRENCE_ABI, sizeof reduce, c->planes, c->weights,
+                                                        c->live_offsets, values, (uint32_t)live, (uint32_t)points, 1,
+                                                        (uint32_t)live, PACMAN_RECURRENCE_OUTPUT_ZERO};
+            if (pacman_recurrence_v1_reduce_resolved(&reduce) != PACMAN_RECURRENCE_OK) {
+                fprintf(stderr, "pacuda: process %s, colour %s: the reduction failed\n", p->key, c->id);
+                return UMAMI_ERROR;
+            }
+        } else {
+            /* the run kept its amplitudes: end it with an empty reduction */
+            uint32_t none[2] = {0, 0};
+            pacman_recurrence_reduce_resolved reduce = {PACMAN_RECURRENCE_ABI, sizeof reduce, c->planes, c->weights,
+                                                        none, values, 1, (uint32_t)points, 1, 1,
+                                                        PACMAN_RECURRENCE_OUTPUT_ZERO};
+            if (pacman_recurrence_v1_reduce_resolved(&reduce) != PACMAN_RECURRENCE_OK) return UMAMI_ERROR;
         }
-        /* the process-group factor (`apply_process_group_factor`), the alpha_s scale */
+        /* the helicity values (zero where no plane is reduced), the process-group factor
+         * (`apply_process_group_factor`), the alpha_s scale */
         for (size_t q = 0; q < points; q++) {
             Item *item = &items[start + q];
-            for (size_t hel = 0; hel < h; hel++) {
-                double v = values[q * h + hel];
+            for (size_t hel = 0; hel < h; hel++) item->values[hel] = 0.0;
+            for (size_t k = 0; k < live; k++) {
+                double v = values[q * live + k];
                 if (p->numerator != p->denominator)
                     v = v * (double)p->numerator / (double)p->denominator;
                 if (item->scale != 1.0) v *= item->scale;
-                item->values[hel] = v;
+                item->values[c->live_helicity[k]] = v;
             }
         }
     }

@@ -66,6 +66,7 @@ struct ReduceResolved {
     points: u32,
     output_stride: u32,
     point_stride: u32,
+    flags: u32,
 }
 
 /// `pacman_recurrence_options`.
@@ -257,6 +258,7 @@ pub fn evaluate(
                 points: count as u32,
                 output_stride: 1,
                 point_stride: h as u32,
+                flags: 0,
             };
             // SAFETY: the tables live during the call; the output covers the tile's points
             let status = unsafe { (runner.reduce_resolved)(&reduce) };

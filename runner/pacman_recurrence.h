@@ -2,6 +2,7 @@
 /* The recurrence runner's C interface (librecurrence.so, recurrence_runner.cu). */
 #ifndef PACMAN_RECURRENCE_H
 #define PACMAN_RECURRENCE_H
+#include <stddef.h>
 #include <stdint.h>
 #ifdef __cplusplus
 extern "C" {
@@ -79,6 +80,8 @@ enum {
 // for k = offsets[o] .. offsets[o+1]-1 in order, (re, im) the run's amplitude plane planes[k] at
 // point i: RustiCol's resolved LC reduction (one output per helicity; `[point][helicity]` is
 // output_stride 1, point_stride the helicity count). One call reduces a kept run (it ends it).
+// flags PACMAN_RECURRENCE_OUTPUT_ZERO: the output starts at zero (cleared on the device, not
+// uploaded; only the results come back).
 typedef struct {
     uint32_t abi_version;
     uint32_t struct_size;
@@ -87,10 +90,15 @@ typedef struct {
     const uint32_t *offsets;  // outputs + 1 entries
     double *output;
     uint32_t outputs, points, output_stride, point_stride;
+    uint32_t flags;
 } pacman_recurrence_reduce_resolved;
+#define PACMAN_RECURRENCE_OUTPUT_ZERO 1u
 
 int pacman_recurrence_v1_run(const pacman_recurrence_call *call);
 int pacman_recurrence_v1_reduce_resolved(const pacman_recurrence_reduce_resolved *reduce);
+// Pinned (page-locked) host memory for the buffers a caller passes (faster copies); NULL if none.
+void *pacman_recurrence_v1_host_alloc(size_t bytes);
+void pacman_recurrence_v1_host_free(void *p);
 int pacman_recurrence_v1_reduce(const pacman_recurrence_reduce *reduce);
 // bit 0: op 12 (sources on the device); bit 1: PACMAN_RECURRENCE_FORMS_ON_DEVICE
 #define PACMAN_RECURRENCE_CAP_SOURCES 1u
