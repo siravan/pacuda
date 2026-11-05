@@ -44,6 +44,7 @@
 
 typedef struct {
     char *id;
+    uint64_t key; /* the runner's cache key of the program (a hash of its words and widths) */
     uint32_t tile;
     uint32_t word_count;
     uint64_t *words;
@@ -278,6 +279,17 @@ static int remap_kernels(uint64_t *words, uint32_t count, const int *map, uint32
     return 1;
 }
 
+/* The runner caches a program by its key: a 64-bit FNV-1a hash of the words and their widths (the
+ * same program has the same key in every library of the output; 0 would mean "do not cache"). */
+static uint64_t program_key(const PColour *c) {
+    uint64_t h = 1469598103934665603ull;
+    const uint8_t *b = c->width;
+    for (int k = 0; k < 8; k++) h = (h ^ b[k]) * 1099511628211ull;
+    b = (const uint8_t *)c->words;
+    for (size_t k = 0; k < (size_t)c->word_count * 8; k++) h = (h ^ b[k]) * 1099511628211ull;
+    return h ? h : 1;
+}
+
 /* ---- the instance ---------------------------------------------------------------------------- */
 
 typedef struct {
@@ -436,7 +448,9 @@ UmamiStatus umami_initialize(UmamiHandle *handle, char const *param_card_path) {
     for (uint32_t i = 0; i < f->process_count; i++)
         for (uint32_t j = 0; j < f->processes[i].colour_count; j++) {
             PColour *c = &f->processes[i].colours[j];
-            if (!remap_kernels(c->words, c->word_count, map, f->sha_count)) {
+            int remapped = remap_kernels(c->words, c->word_count, map, f->sha_count);
+            c->key = program_key(c);
+            if (!remapped) {
                 fprintf(stderr, "pacuda: process %s, colour %s: a symjit kernel outside the table\n",
                         f->processes[i].key, c->id);
                 free(map);
@@ -576,7 +590,7 @@ static UmamiStatus evaluate(Instance *instance, Item *items, size_t count, doubl
         call.abi_version = PACMAN_RECURRENCE_ABI;
         call.struct_size = sizeof call;
         call.words = c->words;
-        call.words_key = 0;
+        call.words_key = c->key;
         call.word_count = c->word_count;
         memcpy(call.width, c->width, 8);
         call.current_re = current_re;
