@@ -94,8 +94,32 @@ typedef struct {
 } pacman_recurrence_reduce_resolved;
 #define PACMAN_RECURRENCE_OUTPUT_ZERO 1u
 
+// After a run with PACMAN_RECURRENCE_KEEP_AMPLITUDES: the helicity sampling of the UMAMI LC
+// pass, per point i < points. With v[k] the value of output k (as `reduce_resolved` from zero,
+// times numerator / denominator when they differ, times scale[i] when scale is given and it is
+// not 1), in the order of the outputs (their helicities ascending):
+//   total[i] = 0 + v[0] + v[1] + ...,
+//   target = random[i] * total[i]; chosen[i] = the helicity of the output at which the cumulative
+//   sum of the positive v (in order) first exceeds target; if it never does, of the last output
+//   with a positive v; with none, 0. As pyAmpliCol's umami.c samples. One call ends a kept run.
+typedef struct {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    const uint32_t *planes;
+    const double *weights;
+    const uint32_t *offsets;   // outputs + 1 entries
+    const uint32_t *helicity;  // per output, its helicity (what `chosen` reports)
+    uint32_t outputs, points;
+    const double *random;      // per point, in [0, 1)
+    const double *scale;       // per point, or NULL (1)
+    double numerator, denominator;
+    double *total;             // per point
+    uint32_t *chosen;          // per point
+} pacman_recurrence_reduce_sample;
+
 int pacman_recurrence_v1_run(const pacman_recurrence_call *call);
 int pacman_recurrence_v1_reduce_resolved(const pacman_recurrence_reduce_resolved *reduce);
+int pacman_recurrence_v1_reduce_sample(const pacman_recurrence_reduce_sample *sample);
 // Pinned (page-locked) host memory for the buffers a caller passes (faster copies); NULL if none.
 void *pacman_recurrence_v1_host_alloc(size_t bytes);
 void pacman_recurrence_v1_host_free(void *p);

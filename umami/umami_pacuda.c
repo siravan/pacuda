@@ -329,7 +329,7 @@ typedef struct {
     double *alpha_s;
     /* host buffers of the runner calls and the reductions (the momenta and the reduction's output
      * pinned) */
-    Pinned external, values;
+    Pinned external, values, sample_in, sample_out;
     double *arena;
     size_t arena_capacity;
 } Instance;
@@ -339,7 +339,11 @@ typedef struct {
     size_t event;
     const UmamiContribution *contribution;
     double scale;     /* (alpha_s / alpha_s0)^p */
-    double *values;   /* its helicity values (into the instance's value buffer) */
+    double random;    /* the helicity's random number (sampling) */
+    double *values;   /* its helicity values (into the instance's value buffer; not sampling) */
+    double total;     /* sampling: the sum of the helicity values and the helicity drawn */
+    uint32_t chosen;
+    size_t index;     /* its position in the event-ordered items */
 } Item;
 
 static bool const supported_inputs[UMAMI_INPUT_KEY_COUNT] = {
@@ -434,6 +438,8 @@ UmamiStatus umami_free(UmamiHandle handle) {
     free(instance->process); free(instance->alpha_s);
     pacman_recurrence_v1_host_free(instance->external.p);
     pacman_recurrence_v1_host_free(instance->values.p);
+    pacman_recurrence_v1_host_free(instance->sample_in.p);
+    pacman_recurrence_v1_host_free(instance->sample_out.p);
     free(instance->arena);
     free(instance);
     return UMAMI_SUCCESS;
@@ -596,9 +602,11 @@ static int compare_items(const void *a, const void *b) {
     return x->event < y->event ? -1 : x->event > y->event;
 }
 
-/* The helicity values of `count` items of one contribution (items[k].values, each `helicities`
- * long), in tiles on the runner. */
-static UmamiStatus evaluate(Instance *instance, Item *items, size_t count, double const *momenta, size_t stride) {
+/* The helicity values of `count` items of one (process, colour, permutation) (items[k].values,
+ * each `helicities` long), in tiles on the runner; with `sample`, instead each item's total and
+ * drawn helicity (items[k].total, .chosen), sampled on the device. */
+static UmamiStatus evaluate(Instance *instance, Item *items, size_t count, double const *momenta, size_t stride,
+                            bool sample) {
     const UmamiContribution *entry = items[0].contribution;
     const PProcess *p = instance->process[entry->process_index];
     const PColour *c = colour_of(instance, entry);
@@ -606,7 +614,9 @@ static UmamiStatus evaluate(Instance *instance, Item *items, size_t count, doubl
     size_t tile = instance->file->batch ? instance->file->batch : c->tile;
     size_t planes = (size_t)c->current_planes * 2 + (size_t)c->amplitude_planes * 2 + c->momentum_planes;
     size_t live = c->live;
-    if (!grow_pinned(&instance->external, n * 4 * tile) || !grow_pinned(&instance->values, (live ? live : 1) * tile) ||
+    if (!grow_pinned(&instance->external, n * 4 * tile) ||
+        (!sample && !grow_pinned(&instance->values, (live ? live : 1) * tile)) ||
+        (sample && (!grow_pinned(&instance->sample_in, 2 * tile) || !grow_pinned(&instance->sample_out, 2 * tile))) ||
         !grow(&instance->arena, &instance->arena_capacity, planes * tile + 1))
         return UMAMI_ERROR;
     double *current_re = instance->arena, *current_im = current_re + (size_t)c->current_planes * tile;
@@ -669,6 +679,40 @@ static UmamiStatus evaluate(Instance *instance, Item *items, size_t count, doubl
         if (pacman_recurrence_v1_run(&call) != PACMAN_RECURRENCE_OK) {
             fprintf(stderr, "pacuda: process %s, colour %s: the runner failed\n", p->key, c->id);
             return UMAMI_ERROR;
+        }
+        if (sample) {
+            /* the totals and the drawn helicities, sampled on the device */
+            double *random = instance->sample_in.p, *scale = random + points, *total = instance->sample_out.p;
+            uint32_t *chosen = (uint32_t *)(total + points);
+            bool scaled = false;
+            for (size_t q = 0; q < points; q++) {
+                random[q] = items[start + q].random;
+                scale[q] = items[start + q].scale;
+                scaled |= scale[q] != 1.0;
+            }
+            if (live) {
+                pacman_recurrence_reduce_sample reduce = {PACMAN_RECURRENCE_ABI, sizeof reduce, c->planes, c->weights,
+                                                          c->live_offsets, c->live_helicity, (uint32_t)live,
+                                                          (uint32_t)points, random, scaled ? scale : NULL,
+                                                          (double)p->numerator, (double)p->denominator, total, chosen};
+                if (pacman_recurrence_v1_reduce_sample(&reduce) != PACMAN_RECURRENCE_OK) {
+                    fprintf(stderr, "pacuda: process %s, colour %s: the sampling failed\n", p->key, c->id);
+                    return UMAMI_ERROR;
+                }
+            } else {
+                /* no helicity has planes: total 0, helicity 0 (as umami.c); end the kept run */
+                uint32_t none[2] = {0, 0};
+                pacman_recurrence_reduce_resolved reduce = {PACMAN_RECURRENCE_ABI, sizeof reduce, c->planes, c->weights,
+                                                            none, total, 1, (uint32_t)points, 1, 1,
+                                                            PACMAN_RECURRENCE_OUTPUT_ZERO};
+                if (pacman_recurrence_v1_reduce_resolved(&reduce) != PACMAN_RECURRENCE_OK) return UMAMI_ERROR;
+                memset(chosen, 0, points * sizeof(uint32_t));
+            }
+            for (size_t q = 0; q < points; q++) {
+                items[start + q].total = total[q];
+                items[start + q].chosen = chosen[q];
+            }
+            continue;
         }
         /* the outputs with planes only ([point][live]), from zero on the device */
         double *values = instance->values.p;
@@ -761,6 +805,8 @@ UmamiStatus umami_matrix_element(UmamiHandle handle, size_t count, size_t stride
             value_count += instance->process[entry->process_index]->helicities;
         }
     }
+    bool sample = !in[UMAMI_IN_HELICITY_INDEX] && out[UMAMI_OUT_HELICITY_INDEX];
+    if (sample) value_count = 0;
     Item *items = malloc(item_count * sizeof *items);
     double *values = malloc((value_count ? value_count : 1) * sizeof(double));
     if (!items || !values) { free(items); free(values); return UMAMI_ERROR; }
@@ -777,8 +823,9 @@ UmamiStatus umami_matrix_element(UmamiHandle handle, size_t count, size_t stride
                                             : instance->alpha_s[entry->process_index];
             double scale = 1.0;
             if (p->alpha_s_name[0] && a != p->alpha_s) scale = pow(a / p->alpha_s, p->qcd_power);
-            items[k] = (Item){event, entry, scale, next};
-            next += p->helicities;
+            double random = in[UMAMI_IN_RANDOM_HELICITY] ? ((double const *)in[UMAMI_IN_RANDOM_HELICITY])[event] : 0.5;
+            items[k] = (Item){event, entry, scale, random, sample ? NULL : next, 0.0, 0, k};
+            if (!sample) next += p->helicities;
             k++;
         }
     }
@@ -792,9 +839,15 @@ UmamiStatus umami_matrix_element(UmamiHandle handle, size_t count, size_t stride
         size_t last = first;
         while (last < item_count && compare_evaluation(sorted[last].contribution, sorted[first].contribution) == 0)
             last++;
-        status = evaluate(instance, sorted + first, last - first, momenta, stride);
+        status = evaluate(instance, sorted + first, last - first, momenta, stride, sample);
         first = last;
     }
+    /* the sampled results back to the items in event order (`sorted` is a copy) */
+    if (sample && status == UMAMI_SUCCESS)
+        for (size_t j = 0; j < item_count; j++) {
+            items[sorted[j].index].total = sorted[j].total;
+            items[sorted[j].index].chosen = sorted[j].chosen;
+        }
     free(sorted);
 
     /* combine the events, as `umami.c` */
@@ -816,19 +869,10 @@ UmamiStatus umami_matrix_element(UmamiHandle handle, size_t count, size_t stride
                 total += entry->factor * item->values[entry->helicity_runtime[label]];
             }
         } else if (out[UMAMI_OUT_HELICITY_INDEX]) {
-            /* sample the helicity in proportion to its contribution */
-            const double *v = items[k].values;
-            size_t h = instance->process[first->process_index]->helicities;
-            for (size_t hel = 0; hel < h; ++hel) total += v[hel];
-            double target = random * total, cumulative = 0.0;
-            size_t chosen = 0;
-            for (size_t hel = 0; hel < h; ++hel) {
-                if (v[hel] <= 0.0) continue;
-                chosen = hel;
-                cumulative += v[hel];
-                if (cumulative > target) break;
-            }
-            label = (int)first->helicity_export[chosen];
+            /* the helicity sampled on the device in proportion to its contribution */
+            (void)random;
+            total = items[k].total;
+            label = (int)first->helicity_export[items[k].chosen];
             total *= first->factor;
         } else {
             for (size_t j = 0; j < selection->contribution_count; ++j) {

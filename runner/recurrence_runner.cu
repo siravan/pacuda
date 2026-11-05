@@ -1526,6 +1526,51 @@ __global__ void reduce_resolved_kernel(const double *are, const double *aim, siz
     output[out] = acc;
 }
 
+// One thread per point: the outputs' values (each from zero, its planes in order), the group
+// factor and the point's scale, their total in order, and umami.c's cumulative choice; the values
+// are computed again in the second pass (the same operations, the same bits).
+template <class R>
+__device__ __forceinline__ double sample_value(const double *are, const double *aim, size_t ld, const uint32_t *planes,
+                                               const double *weights, uint32_t first, uint32_t end, size_t i,
+                                               bool factor, double numerator, double denominator, double scale) {
+    double acc = 0.0;
+    for (uint32_t k = first; k < end; k++) {
+        size_t at = (size_t)__ldg(planes + k) * ld + i;
+        double re = as_double(ldr<R>(are, at)), im = as_double(ldr<R>(aim, at));
+        acc = __dadd_rn(acc, __dmul_rn(__ldg(weights + k), __fma_rn(re, re, __dmul_rn(im, im))));
+    }
+    if (factor) acc = __ddiv_rn(__dmul_rn(acc, numerator), denominator);
+    if (scale != 1.0) acc = __dmul_rn(acc, scale);
+    return acc;
+}
+
+template <class R>
+__global__ void reduce_sample_kernel(const double *are, const double *aim, size_t ld, const uint32_t *planes,
+                                     const double *weights, const uint32_t *offsets, const uint32_t *helicity,
+                                     uint32_t outputs, uint32_t points, const double *random, const double *scale,
+                                     bool factor, double numerator, double denominator, double *total,
+                                     uint32_t *chosen) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= points) return;
+    double s = scale ? scale[i] : 1.0;
+    double t = 0.0;
+    for (uint32_t o = 0; o < outputs; o++)
+        t = __dadd_rn(t, sample_value<R>(are, aim, ld, planes, weights, __ldg(offsets + o), __ldg(offsets + o + 1), i,
+                                         factor, numerator, denominator, s));
+    double target = __dmul_rn(random[i], t), cumulative = 0.0;
+    uint32_t pick = 0;
+    for (uint32_t o = 0; o < outputs; o++) {
+        double v = sample_value<R>(are, aim, ld, planes, weights, __ldg(offsets + o), __ldg(offsets + o + 1), i,
+                                   factor, numerator, denominator, s);
+        if (v <= 0.0) continue;
+        pick = __ldg(helicity + o);
+        cumulative = __dadd_rn(cumulative, v);
+        if (cumulative > target) break;
+    }
+    total[i] = t;
+    chosen[i] = pick;
+}
+
 // device buffers of at least `n` elements
 template <class T> static bool reserve(T **p, size_t *capacity, size_t n, const char *what) {
     if (n <= *capacity) return true;
@@ -1580,6 +1625,61 @@ static int reduce_resolved_locked(const pacman_recurrence_reduce_resolved *r) {
         return PACMAN_RECURRENCE_DEVICE_ERROR;
     device.copies += zero ? 1 : 2;
     device.bytes += (zero ? 1 : 2) * span * sizeof(double);
+    device.reductions++;
+    if (device.stats) device.seconds += now() - start;
+    return PACMAN_RECURRENCE_OK;
+}
+
+static int reduce_sample_locked(const pacman_recurrence_reduce_sample *r) {
+    initialize();
+    if (!r || r->abi_version != PACMAN_RECURRENCE_ABI || r->struct_size != sizeof(pacman_recurrence_reduce_sample) ||
+        !r->offsets || !r->helicity || !r->random || !r->total || !r->chosen || r->outputs == 0)
+        return PACMAN_RECURRENCE_INVALID;
+    if (!device.kept || r->points != device.kept_points) return PACMAN_RECURRENCE_INVALID;
+    uint32_t count = r->offsets[r->outputs];
+    if (r->offsets[0] != 0 || (count && (!r->planes || !r->weights))) return PACMAN_RECURRENCE_INVALID;
+    for (uint32_t o = 0; o < r->outputs; o++)
+        if (r->offsets[o] > r->offsets[o + 1]) return PACMAN_RECURRENCE_INVALID;
+    for (uint32_t k = 0; k < count; k++)
+        if (r->planes[k] >= device.kept_planes) return PACMAN_RECURRENCE_INVALID;
+    if (r->points == 0) return PACMAN_RECURRENCE_OK;
+    double start = device.stats ? now() : 0;
+    static uint32_t *offsets = nullptr, *helicity = nullptr, *chosen = nullptr;
+    static double *random = nullptr, *scale = nullptr, *total = nullptr;
+    static size_t offsets_capacity = 0, helicity_capacity = 0, chosen_capacity = 0, random_capacity = 0,
+                  scale_capacity = 0, total_capacity = 0;
+    size_t n = r->points;
+    if (!reserve(&device.rplanes, &device.rcount_capacity, std::max<size_t>(count, 1), "sampling") ||
+        !reserve(&device.rweights, &device.rweights_capacity, std::max<size_t>(count, 1), "sampling") ||
+        !reserve(&offsets, &offsets_capacity, r->outputs + 1, "sampling") ||
+        !reserve(&helicity, &helicity_capacity, r->outputs, "sampling") ||
+        !reserve(&random, &random_capacity, n, "sampling") || !reserve(&scale, &scale_capacity, n, "sampling") ||
+        !reserve(&total, &total_capacity, n, "sampling") || !reserve(&chosen, &chosen_capacity, n, "sampling"))
+        return PACMAN_RECURRENCE_DEVICE_ERROR;
+    if ((count && (failed(cudaMemcpy(device.rplanes, r->planes, count * sizeof(uint32_t), cudaMemcpyHostToDevice), "sampling") ||
+                   failed(cudaMemcpy(device.rweights, r->weights, count * sizeof(double), cudaMemcpyHostToDevice), "sampling"))) ||
+        failed(cudaMemcpy(offsets, r->offsets, (r->outputs + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice), "sampling") ||
+        failed(cudaMemcpy(helicity, r->helicity, r->outputs * sizeof(uint32_t), cudaMemcpyHostToDevice), "sampling") ||
+        failed(cudaMemcpy(random, r->random, n * sizeof(double), cudaMemcpyHostToDevice), "sampling") ||
+        (r->scale && failed(cudaMemcpy(scale, r->scale, n * sizeof(double), cudaMemcpyHostToDevice), "sampling")))
+        return PACMAN_RECURRENCE_DEVICE_ERROR;
+    bool factor = r->numerator != r->denominator;
+    unsigned block = 128, grid = (unsigned)((n + block - 1) / block);
+    if (device.kept_df64)
+        reduce_sample_kernel<D><<<grid, block>>>(device.are, device.aim, device.kept_stride, device.rplanes, device.rweights,
+                                                 offsets, helicity, r->outputs, r->points, random, r->scale ? scale : nullptr,
+                                                 factor, r->numerator, r->denominator, total, chosen);
+    else
+        reduce_sample_kernel<double><<<grid, block>>>(device.are, device.aim, device.kept_stride, device.rplanes,
+                                                      device.rweights, offsets, helicity, r->outputs, r->points, random,
+                                                      r->scale ? scale : nullptr, factor, r->numerator, r->denominator,
+                                                      total, chosen);
+    if (failed(cudaGetLastError(), "sampling") ||
+        failed(cudaMemcpy(r->total, total, n * sizeof(double), cudaMemcpyDeviceToHost), "sampling") ||
+        failed(cudaMemcpy(r->chosen, chosen, n * sizeof(uint32_t), cudaMemcpyDeviceToHost), "sampling"))
+        return PACMAN_RECURRENCE_DEVICE_ERROR;
+    device.copies += r->scale ? 4 : 3;
+    device.bytes += n * (sizeof(double) * (r->scale ? 3 : 2) + sizeof(uint32_t));
     device.reductions++;
     if (device.stats) device.seconds += now() - start;
     return PACMAN_RECURRENCE_OK;
@@ -1741,6 +1841,13 @@ extern "C" void *pacman_recurrence_v1_host_alloc(size_t bytes) {
 
 extern "C" void pacman_recurrence_v1_host_free(void *p) {
     if (p) cudaFreeHost(p);
+}
+
+extern "C" int pacman_recurrence_v1_reduce_sample(const pacman_recurrence_reduce_sample *r) {
+    acquire_runner_lock();
+    int status = reduce_sample_locked(r);
+    release_runner_lock();
+    return status;
 }
 
 extern "C" int pacman_recurrence_v1_reduce_resolved(const pacman_recurrence_reduce_resolved *r) {

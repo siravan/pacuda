@@ -207,6 +207,56 @@ int main(int argc, char **argv) {
                 return 1;
             }
     }
+    /* the device sampling (pacman_recurrence_v1_reduce_sample) against umami.c's, on the host: the
+     * outputs' values with a group factor and a per-point scale, their total, the cumulative choice */
+    int (*reduce_sample)(const pacman_recurrence_reduce_sample *) =
+        (int (*)(const pacman_recurrence_reduce_sample *))dlsym(lib, "pacman_recurrence_v1_reduce_sample");
+    if (!reduce_sample) { fprintf(stderr, "no pacman_recurrence_v1_reduce_sample\n"); return 1; }
+    {
+        enum { OUTS = 3 };
+        uint32_t splanes[6] = {2, 0, 0, 1, 0, 2};
+        double sweights[6] = {0.75, 1.5, 2.0, -0.25, 0.5, -3.0};
+        uint32_t soffsets[OUTS + 1] = {0, 2, 4, 6};
+        uint32_t shelicity[OUTS] = {1, 4, 7};
+        static double srandom[POINTS], sscale[POINTS], stotal[POINTS], wtotal[POINTS];
+        static uint32_t schosen[POINTS], wchosen[POINTS];
+        double num = 3.0, den = 7.0;
+        for (int i = 0; i < POINTS; i++) {
+            srandom[i] = (i * 0.6180339887498949) - (int)(i * 0.6180339887498949);
+            sscale[i] = i % 3 ? 1.0 : 1.0 + 0.001 * i;
+            double v[OUTS], t = 0.0;
+            for (int o = 0; o < OUTS; o++) {
+                double acc = 0.0;
+                for (uint32_t k = soffsets[o]; k < soffsets[o + 1]; k++) {
+                    double re = are[splanes[k] * STRIDE + i], im = aim[splanes[k] * STRIDE + i];
+                    acc += sweights[k] * fma(re, re, im * im);
+                }
+                acc = acc * num / den;
+                if (sscale[i] != 1.0) acc *= sscale[i];
+                v[o] = acc;
+                t += acc;
+            }
+            double target = srandom[i] * t, cumulative = 0.0;
+            uint32_t pick = 0;
+            for (int o = 0; o < OUTS; o++) {
+                if (v[o] <= 0.0) continue;
+                pick = shelicity[o];
+                cumulative += v[o];
+                if (cumulative > target) break;
+            }
+            wtotal[i] = t;
+            wchosen[i] = pick;
+        }
+        if (run(&k2) != 0) return 1;
+        pacman_recurrence_reduce_sample rs = {1, sizeof rs, splanes, sweights, soffsets, shelicity, OUTS, POINTS,
+                                              srandom, sscale, num, den, stotal, schosen};
+        if (reduce_sample(&rs) != 0) { fprintf(stderr, "reduce_sample failed\n"); return 1; }
+        for (int i = 0; i < POINTS; i++)
+            if (memcmp(&wtotal[i], &stotal[i], 8) || wchosen[i] != schosen[i]) {
+                fprintf(stderr, "sampling, point %d: %.17g, %u for %.17g, %u\n", i, stotal[i], schosen[i], wtotal[i], wchosen[i]);
+                return 1;
+            }
+    }
     for (int p = 0; p < AP; p++)
         for (int i = 0; i < POINTS; i++) printf("%.17g %.17g\n", are[p * STRIDE + i], aim[p * STRIDE + i]);
     return 0;
