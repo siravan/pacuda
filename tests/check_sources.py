@@ -1,4 +1,4 @@
-"""pac2json's legend of the source wavefunctions (main.json configs.conventions.sources, transcribed
+"""pac2json's legend of the source wavefunctions (convert/CONVENTIONS.md, Sources; transcribed
 here) against the runner's source_values (pacman_recurrence_v1_test_sources), on random momenta of
 every family, energy sign, helicity and chirality.
 usage: check_sources.py librecurrence.so"""

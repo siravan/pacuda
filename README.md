@@ -24,7 +24,8 @@ bit (f64 kernel). See `symjit-playground/plans/pacman-ptx/PACUDA.md` for the des
   `check FILE --runner librecurrence.so`, `record LC_DIR [--replay ...]`. Used only to convert.
   The same crate builds `pac2json`, a human-readable copy of an artifact's recurrence programs:
   `pac2json LC_DIR -o DIR` writes `DIR/main.json` (per (process, colour): the inputs, the outputs,
-  the currents with their initial values, the body, the reduction; a legend under `configs`),
+  the currents with their initial values, the body, the reduction; the legend is
+  `convert/CONVENTIONS.md`),
   `DIR/examples.json` (reference momenta and the CPU's outputs) and `DIR/kernels/` (the symjit
   kernels; with symjit-utils' `sjb2obj` on the PATH or given by `--sjb2obj PATH`, also each
   kernel's shared library `<sha256>.so` and C header), and checks that they read back as the
